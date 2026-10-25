@@ -66,6 +66,9 @@ dsh-qq-sticker/
   test-tagging.mjs        # 22 条：标签类别解析 / 词表合成 / 对齐 / 提示词
   test-proactive.mjs      # 46 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
   test-zip-backup.mjs     # 36 条：ZIP 往返 + 系统解压器双重验证 + 备份保留策略
+  test-config-writable.mjs # 8 条：Config 可写性（13 段 / 65 叶子 volatile + live Schema 比对）
+  docs/
+    settings-save-troubleshooting.md  # 「保存失败 / 需重启」的根因与排查（含实测证据）
 ```
 
 ---
@@ -287,6 +290,7 @@ node test-store.mjs                # 11 条：存储目录解析 / 搬迁 / 路�
 node test-tagging.mjs              # 22 条：标签类别 / 词表合成 / 对齐 / 提示词
 node test-proactive.mjs            # 46 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
 node test-zip-backup.mjs           # 36 条：ZIP 往返 + 系统解压验证 + 备份保留
+node test-config-writable.mjs      # 8 条：Config 可写性（源码 13 段/65 叶子 volatile + live Schema 比对）
 ```
 
 全部**不联网、不起进程、不碰 DSH**。`--real-cordis` 会自己去找
