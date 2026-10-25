@@ -349,18 +349,34 @@ await check('一条带图的 user/message 会被收进库', async () => {
   })
 })
 
-await check('大尺寸照片（stickerOnly 下）不会被收', async () => {
+await check('超大照片（stickerOnly 下）不会被收', async () => {
   await withPlugin(async ({ ctx, runtime }) => {
     const attachments = makeAttachments()
     ctx.services.attachments = attachments
     runtime.attachments = attachments
-    const ref = await attachments.saveImage({ data: makePng(1080, 1260), mediaType: 'image/png', name: 'photo.png' })
+    // 上限已从 640px 放宽到 1920px：这里用 2400px 才构成"照片"
+    const ref = await attachments.saveImage({ data: makePng(2400, 2000), mediaType: 'image/png', name: 'photo.png' })
     ctx.emit('session/event', { id: 'session-1' }, {
       type: 'user/message',
       data: { message: { role: 'user', content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } } },
     })
     await sleep(250)
     assert.equal(runtime.library.size, 0, '大图不该被当成表情收进来')
+  })
+})
+
+await check('放宽后 1920px 内的图会被收（以前 640px 上限会误杀）', async () => {
+  await withPlugin(async ({ ctx, runtime }) => {
+    const attachments = makeAttachments()
+    ctx.services.attachments = attachments
+    runtime.attachments = attachments
+    const ref = await attachments.saveImage({ data: makePng(1800, 1700), mediaType: 'image/png', name: 'big-sticker.png' })
+    ctx.emit('session/event', { id: 'session-1' }, {
+      type: 'user/message',
+      data: { message: { role: 'user', content: [{ type: 'image', attachment: ref }], source: { kind: 'user' } } },
+    })
+    await sleep(250)
+    assert.equal(runtime.library.size, 1, '1920px 内的图应该被收进来')
   })
 })
 

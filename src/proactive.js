@@ -497,11 +497,12 @@ export function chooseSticker({ cfg, sessionId, visible, mood = '', keyword = ''
 export function looksLikeSticker(item, cfg) {
   if (!item) return false
   const ext = String(item.ext ?? '').toLowerCase()
+  // 动图一律算表情（QQ 里 GIF 就是表情），不受尺寸/字节限制
   if (ext === 'gif') return true
   if (item.animated === true) return true
   const longest = Math.max(num(item.width, 0), num(item.height, 0))
-  const maxDim = num(cfg?.collect?.stickerMaxDim, 640)
-  const maxBytes = num(cfg?.collect?.stickerMaxBytes, 1572864)
+  const maxDim = num(cfg?.collect?.stickerMaxDim, 1920)
+  const maxBytes = num(cfg?.collect?.stickerMaxBytes, 10485760)
   if (!longest) return num(item.bytes, 0) <= maxBytes
   if (longest > maxDim) return false
   if (num(item.bytes, 0) > maxBytes) return false

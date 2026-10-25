@@ -592,7 +592,7 @@ function makeSettings(cfg) {
   }
 }
 
-await check('registerRoutes：注册出的路径与契约一致（4 个 exact 路径覆盖 5 条逻辑路由）', async () => {
+await check('registerRoutes：注册出的路径与契约一致（6 个 exact 路径覆盖 7 条逻辑路由）', async () => {
   const webServer = makeWebServer()
   const { dispose } = await makeServerRuntime({ webServer })
   // webServer.register 是 per-path 的（同 path 重复注册会抛 duplicate），
@@ -601,6 +601,8 @@ await check('registerRoutes：注册出的路径与契约一致（4 个 exact �
   assert.deepEqual(paths, [
     `${ROUTE_PREFIX}/action`,
     `${ROUTE_PREFIX}/config`,
+    `${ROUTE_PREFIX}/open-path`,
+    `${ROUTE_PREFIX}/raw-image`,
     `${ROUTE_PREFIX}/report`,
     `${ROUTE_PREFIX}/state`,
   ], `注册路径不对：${paths.join(',')}`)
@@ -608,7 +610,7 @@ await check('registerRoutes：注册出的路径与契约一致（4 个 exact �
     assert.equal(route.kind, 'exact', `${route.path} 应该是 exact 路由`)
     assert.equal(typeof route.handler, 'function')
   }
-  // 5 条逻辑路由：state(GET) / report(GET) / config(GET) / config(POST) / action(POST)
+  // 7 条逻辑路由：state GET / report GET / config GET / config POST / action POST / raw-image POST / open-path POST
   const routeOf = (p) => webServer.routes.find((route) => route.path === p)
   assert.equal(typeof routeOf(`${ROUTE_PREFIX}/state`), 'object')
   assert.equal(typeof routeOf(`${ROUTE_PREFIX}/report`), 'object')
@@ -928,7 +930,7 @@ await check('inject 方式挂载：webServer 未发布时先不注册，发布�
     services.webServer = webServer
     const scoped = { get: (name) => services[name], effect: ctx.effect.bind(ctx) }
     pendingInject[0].callback(scoped)
-    assert.equal(webServer.routes.length, 4, `发布后应注册 4 条路径，实际 ${webServer.routes.length}`)
+    assert.equal(webServer.routes.length, 6, `发布后应注册 6 条路径，实际 ${webServer.routes.length}`)
     const paths = webServer.routes.map((route) => route.path).sort()
     assert.ok(paths.includes(`${ROUTE_PREFIX}/state`), `应有 state 路由，实际 ${paths.join(',')}`)
     assert.ok(paths.includes(`${ROUTE_PREFIX}/action`), '应有 action 路由')
@@ -955,7 +957,7 @@ await check('离线假 ctx（没有 inject）退回 ctx.effect 挂载，不炸',
     const runtime = createRuntime(ctx, { ...DEFAULTS })
     startLifecycle(ctx, runtime)
     await sleep(50)
-    assert.equal(webServer.routes.length, 4, `假 ctx 应立即注册 4 条路径，实际 ${webServer.routes.length}`)
+    assert.equal(webServer.routes.length, 6, `假 ctx 应立即注册 6 条路径，实际 ${webServer.routes.length}`)
     await ctx.effects.reverse().forEach((entry) => { try { entry.dispose?.() } catch { /* ignore */ } })
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
@@ -1113,7 +1115,7 @@ await check('真 HTTP：契约 §1/§2/§4/§5 的状态码与响应体全部符
 
 console.log('\n== 真 Cordis（webServer 晚于插件发布 —— 最初 404 的根因）')
 
-await check('真 Cordis：旧写法复现 404；新写法等 webServer 发布后注册 4 条路由', async () => {
+await check('真 Cordis：旧写法复现 404；新写法等 webServer 发布后注册 6 条路由', async () => {
   // 找不到真 Cordis 就跳过（与 test-cordis-regression.mjs 同一套指路方式）。
   const { existsSync } = await import('node:fs')
   const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
@@ -1147,7 +1149,7 @@ await check('真 Cordis：旧写法复现 404；新写法等 webServer 发布后
       }
     }
   }
-  const WANT = [`${ROUTE_PREFIX}/state`, `${ROUTE_PREFIX}/report`, `${ROUTE_PREFIX}/config`, `${ROUTE_PREFIX}/action`]
+  const WANT = [`${ROUTE_PREFIX}/state`, `${ROUTE_PREFIX}/report`, `${ROUTE_PREFIX}/config`, `${ROUTE_PREFIX}/raw-image`, `${ROUTE_PREFIX}/open-path`, `${ROUTE_PREFIX}/action`]
 
   // 临时数据目录（createRuntime 会往 $DSH_HOME 下建库）
   const dir = await mkdtemp(path.join(os.tmpdir(), 'dsh-qq-sticker-panel-cordis-'))
@@ -1195,7 +1197,7 @@ await check('真 Cordis：旧写法复现 404；新写法等 webServer 发布后
     const fiberA = ctx.plugin(NewServerA)
     await fiberA
     await sleep(300)
-    assert.deepEqual([...routesNew].sort(), [...WANT].sort(), `webServer 发布后应注册 4 条路由，实际 ${routesNew.join(',')}`)
+    assert.deepEqual([...routesNew].sort(), [...WANT].sort(), `webServer 发布后应注册 6 条路由，实际 ${routesNew.join(',')}`)
 
     // ── C：换 webServer 实现 → inject 回调重跑，路由搬到新服务 ──
     fiberA.dispose()

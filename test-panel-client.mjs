@@ -209,6 +209,7 @@ const STATE = {
     },
     gif: { normalizeOnSend: false, marked: 0, lastMarkedAt: 0 },
   },
+  rawPool: { count: 2, bytes: 82000 },
   jobs: [],
 }
 
@@ -216,9 +217,9 @@ const CONFIG = {
   enabled: true,
   debug: false,
   library: { maxCount: 500, maxTotalMB: 200, maxItemMB: 6, blockedIds: '', hiddenIds: '' },
-  collect: { enabled: true, everyHours: 12, windowMin: 30, topHours: 24, topCount: 10, maxPerHour: 10, stickerOnly: true, stickerMaxDim: 640, stickerMaxBytes: 1572864 },
+  collect: { enabled: true, everyHours: 12, windowMin: 30, topHours: 24, topCount: 10, maxPerHour: 10, stickerOnly: true, stickerMaxDim: 1920, stickerMaxBytes: 10485760 },
   vision: { recognizeOnIngest: true, ingestBudgetPerDay: 20, autoTagAfterScan: true, organizeBatchSize: 4, organizeMaxAttempts: 2, organizeOnTagFail: 'delete', providerId: '', model: '' },
-  send: { frequency: 'occasional', minIntervalSec: 30, globalIntervalSec: 15, dailyLimit: 40, keepRecentCount: 5, showTextInContext: true, sendAsSticker: true, subType: 1, adminOnly: true, adminIds: '' },
+  send: { frequency: 'occasional', minIntervalSec: 30, globalIntervalSec: 15, dailyLimit: 40, keepRecentCount: 5, showTextInContext: true, sendAsSticker: true, subType: 1, imagePosition: 'after', adminOnly: true, adminIds: '' },
   prompt: { encourage: 3, maxCandidates: 8, candidatesLevel: 'compact', blockOtherSticker: true },
   maintenance: { deleteOldestCount: 25, deleteOldestKeep: 10 },
   // v2 段：设置页会读它们
@@ -1285,6 +1286,106 @@ await check('拿不到模型目录时退化成可手填，不是死控件', asyn
   assert.ok(row, '应有意图分析模型这一行')
   const inputs = findAll(row, (node) => node.type === 'input' && node.props?.type === 'text')
   assert.equal(inputs.length, 1, '目录不可用时应给出可手填的文本框')
+})
+
+console.log('\n⑥-d GIF / 路径管理 / 发送位置的回归')
+
+await check('发送设置里有「图片位置」下拉，选项是 文字之后/文字之前', async () => {
+  const { tree } = await openConfigSection('发送设置')
+  const row = findAll(tree, (node) => hasToken(node, 'qqs-row'))
+    .find((node) => textOf(node).includes('图片位置'))
+  assert.ok(row, '应有图片位置这一行')
+  const select = findAll(row, (node) => node.type === 'select')[0]
+  assert.ok(select, `图片位置应渲染成下拉，实际：${textOf(row).slice(0, 80)}`)
+  const labels = findAll(select, (node) => node.type === 'option').map(textOf)
+  assert.deepEqual(labels, ['文字之后', '文字之前'])
+})
+
+await check('改「图片位置」写回 send.imagePosition', async () => {
+  const { mount, tree } = await openConfigSection('发送设置')
+  const row = findAll(tree, (node) => hasToken(node, 'qqs-row'))
+    .find((node) => textOf(node).includes('图片位置'))
+  const select = findAll(row, (node) => node.type === 'select')[0]
+  await select.props.onChange({ target: { value: 'before' } })
+  await settle(8)
+  const hit = mount.mutations.find((entry) => entry.ops?.[0]?.path?.join('.') === 'send.imagePosition')
+  assert.ok(hit, `应写入 send.imagePosition，实际：${JSON.stringify(mount.mutations.map((e) => e.ops))}`)
+  assert.equal(hit.ops[0].value, 'before')
+})
+
+await check('操作页有「打开本地文件夹」按钮', async () => {
+  const { tree } = await openTab('actions')
+  const titles = findAll(tree, (node) => classOf(node) === 'qqs-card-title').map(textOf)
+  assert.ok(titles.some((text) => text.includes('本地文件')), `应有本地文件卡，实际：${JSON.stringify(titles)}`)
+  const button = findAll(tree, (node) => node.type === 'button')
+    .find((node) => textOf(node) === '打开本地文件夹')
+  assert.ok(button, '应有「打开本地文件夹」按钮')
+})
+
+await check('点「打开本地文件夹」会 POST /open-path', async () => {
+  fetchLog.length = 0
+  const mount = mountMain()
+  let tree = await renderPanelSettled(mount)
+  await settle(8)
+  findAll(tree, (node) => node.props?.role === 'tab').find((tab) => textOf(tab) === '操作').props.onClick()
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(8)
+  const button = findAll(tree, (node) => node.type === 'button')
+    .find((node) => textOf(node) === '打开本地文件夹')
+  assert.ok(button, '应有打开文件夹按钮')
+  await button.props.onClick()
+  await settle(10)
+  const hit = fetchLog.find((entry) => entry.url.endsWith('/open-path'))
+  assert.ok(hit, `应 POST /open-path，实际请求：${JSON.stringify(fetchLog.map((e) => e.url))}`)
+  assert.equal(hit.method, 'POST')
+  assert.ok(String(hit.body).includes('"sub"'), '请求体应带 sub 字段')
+})
+
+await check('高级设置有路径输入框 + 浏览按钮（自定义存储目录）', async () => {
+  const { tree } = await openConfigSection('高级设置')
+  const row = findAll(tree, (node) => hasToken(node, 'qqs-row-block'))
+    .find((node) => textOf(node).includes('自定义存储目录'))
+  assert.ok(row, '应有自定义存储目录这一行')
+  const input = findAll(row, (node) => node.type === 'input' && node.props?.type === 'text')[0]
+  assert.ok(input, '应有路径输入框')
+  const browse = findAll(row, (node) => node.type === 'button')
+    .find((node) => textOf(node) === '浏览')
+  assert.ok(browse, '应有「浏览」按钮')
+  assert.ok(textOf(row).includes('重启'), `应提示需重启，实际：${textOf(row).slice(0, 120)}`)
+})
+
+await check('路径输入框失焦会写回 store.dataDir', async () => {
+  const mount = mountMain()
+  let tree = await renderPanelSettled(mount)
+  await settle(8)
+  findAll(tree, (node) => node.props?.role === 'tab').find((tab) => textOf(tab) === '设置').props.onClick()
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(8)
+  findAll(tree, (node) => classOf(node) === 'qqs-sec-head').find((n) => textOf(n).includes('高级设置')).props.onClick()
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(10)
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(10)
+  const grab = () => {
+    const row = findAll(tree, (node) => hasToken(node, 'qqs-row-block'))
+      .find((node) => textOf(node).includes('自定义存储目录'))
+    return findAll(row, (node) => node.type === 'input' && node.props?.type === 'text')[0]
+  }
+  let input = grab()
+  assert.ok(input, '应有路径输入框')
+  input.props.onFocus()
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(6)
+  input = grab()
+  input.props.onChange({ target: { value: 'D:\\Emoji' } })
+  tree = renderTree(mount.main.component, mount.props)
+  await settle(6)
+  input = grab()
+  input.props.onBlur()
+  await settle(10)
+  const hit = mount.mutations.find((entry) => entry.ops?.[0]?.path?.join('.') === 'store.dataDir')
+  assert.ok(hit, `应写入 store.dataDir，实际：${JSON.stringify(mount.mutations.map((e) => e.ops))}`)
+  assert.equal(hit.ops[0].value, 'D:\\Emoji')
 })
 
 await check('remote 不可用时显示只读提示，控件禁用', async () => {

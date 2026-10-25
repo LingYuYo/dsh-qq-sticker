@@ -24,3 +24,6 @@ Thumbs.db
 # 开发期临时目录（跑测试生成的 tmp）
 .tmp/
 coverage/
+
+# 临时测试素材（GIF 发送验证等）
+.tmp-test/

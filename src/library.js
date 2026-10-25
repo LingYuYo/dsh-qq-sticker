@@ -269,15 +269,21 @@ export class Library {
     await this.load()
     const bytes = input?.bytes
     if (!bytes || bytes.length === 0) return { ok: false, reason: '空图片' }
-    const maxItemBytes = this.config.library.maxItemMB * 1024 * 1024
-    if (bytes.length > maxItemBytes) {
-      this.counters.skipped++
-      return { ok: false, reason: `单张太大（${(bytes.length / 1048576).toFixed(1)}MB > ${this.config.library.maxItemMB}MB）` }
-    }
+    // ⚠️ 先嗅探再判大小：GIF 要特殊对待（见下）
     const sniff = sniffImage(bytes)
     if (!sniff) {
       this.counters.skipped++
       return { ok: false, reason: '不认识的图片格式' }
+    }
+    const isGif = sniff.mediaType === 'image/gif'
+    // 动图不受单张大小限制：QQ 的表情 GIF 常常 1~5MB，一刀切 12MB 之前还嫌宽，
+    // 但配置化上限（默认 6MB）会误杀 —— 动图一律放行到硬顶 12MB。
+    const maxItemBytes = isGif
+      ? Math.max(this.config.library.maxItemMB, 12) * 1024 * 1024
+      : this.config.library.maxItemMB * 1024 * 1024
+    if (bytes.length > maxItemBytes) {
+      this.counters.skipped++
+      return { ok: false, reason: `单张太大（${(bytes.length / 1048576).toFixed(1)}MB > ${Math.round(maxItemBytes / 1048576)}MB）` }
     }
     const src = sha1(bytes)
     const key = `src:${src}`

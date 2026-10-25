@@ -958,6 +958,9 @@ export async function buildTools(runtime) {
  * 为什么走嵌套 execute 而不是自己发：DSH 的消息出口在桥接进程里，
  * 宿主侧唯一被支持的发图方式就是调那个工具（它也带着 20s 回执等待）。
  * 我们只负责准备 file 与把失败原因翻译成人话。
+ *
+ * `subType` 决定 QQ 里呈现形态：1 = 小表情（可长按收藏），0 = 普通大图。
+ * 走 `arguments.subType` 一条链路透传到 NapCat 的 image 段（2026-10-26 加）。
  */
 async function callSendImage(ctx, exec, fileRef, config) {
   // ⚠️ 必须走 safeService：`ctx.tools` 在真 Cordis 上会抛 without-inject
@@ -967,12 +970,13 @@ async function callSendImage(ctx, exec, fileRef, config) {
   }
   const agent = exec?.agent
   if (!agent) return { ok: false, reason: '拿不到当前会话，发不了图' }
+  const subType = config?.send?.sendAsSticker === false ? 0 : (config?.send?.subType === 0 ? 0 : 1)
   let result
   try {
     result = await tools.execute({
       callId: `sticker-send-${Date.now().toString(36)}`,
       name: 'qq_send_image',
-      arguments: { file: fileRef },
+      arguments: { file: fileRef, subType },
       agent,
       signal: exec.signal ?? AbortSignal.timeout(30_000),
     })

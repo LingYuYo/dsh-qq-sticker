@@ -50,6 +50,7 @@ dsh-qq-sticker/
     actions.js          # 面板动作实现（与 tools.js 同一套逻辑，供 HTTP 调用）
     server.js           # HTTP：/state、/config、/action、/report
     store.js            # v2：存储目录解析 + 首次搬迁（不覆盖已有库）
+    rawstore.js         # v2.1：原始图池（桥接转交的未转码字节，GIF 动画保真）
     tagging.js          # v2：标签体系（预设类别 + 自定义词表 + 提示词拼装）
     proactive.js        # v2：主动发图 / 斗图 / 连发 / 团战（回合末补图）
     zip.js              # v2：手写 ZIP（deflate + crc32，零依赖）
@@ -58,7 +59,7 @@ dsh-qq-sticker/
   icon.svg
   test-offline.mjs        # 78 条：纯逻辑
   test-integration.mjs    # 17 条：假 ctx 跑装配与事件流
-  test-panel-client.mjs   # 70 条：面板槽位 / 三 Tab / 设置页（卡片·层级·下拉）/ 数据通路 / 红线
+  test-panel-client.mjs   # 76 条：面板槽位 / 三 Tab / 设置页（卡片·层级·下拉·路径）/ 数据通路 / 红线
   test-panel-host.mjs     # 39 条：jobs / actions / 路由 / state 字段
   test-panel-e2e.mjs      # 20 条：真实路由的 HTTP 状态码与响应体
   test-contract.mjs       # 9 条：client 字段 ↔ Host 返回的一致性
@@ -67,6 +68,9 @@ dsh-qq-sticker/
   test-proactive.mjs      # 46 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
   test-zip-backup.mjs     # 36 条：ZIP 往返 + 系统解压器双重验证 + 备份保留策略
   test-config-writable.mjs # 8 条：Config 可写性（13 段 / 65 叶子 volatile + live Schema 比对）
+  test-gif.mjs            # 15 条：GIF 收集放宽 / 原始图池 / 发送位置与 sub_type
+  test-rawimage.mjs       # 8 条：桥接↔插件原始图转交协议（/raw-image + [[qqimg:]] 对齐）
+  test-llm-call.mjs       # 7 条：prepareCall 与 stream 配置一致（打标报错的回归守卫）
   docs/
     settings-save-troubleshooting.md  # 「保存失败 / 需重启」的根因与排查（含实测证据）
 ```
@@ -282,7 +286,7 @@ node test-load.mjs --real-cordis   # ★ 用真 Cordis 装载（能复现真机�
 node test-cordis-regression.mjs    # 回归：Cordis「未声明服务属性」陷阱焊死
 node test-offline.mjs              # 78 条：库/闸/评分/解析/工具定义
 node test-integration.mjs          # 17 条：假 ctx 跑装配、agent/created、收图、发送、落盘
-node test-panel-client.mjs         # 70 条：面板槽位 / 三 Tab / 设置页（卡片·层级·下拉）/ 数据通路 / CSS 红线
+node test-panel-client.mjs         # 76 条：面板槽位 / 三 Tab / 设置页 / 路径管理 / 数据通路 / CSS 红线
 node test-panel-host.mjs           # 39 条：Host 侧 jobs / actions / 路由 / state 字段
 node test-panel-e2e.mjs            # 20 条：真实路由跑一遍，验 HTTP 状态码与响应体
 node test-contract.mjs             # 9 条：client 读的字段与 Host 返回的一致性
@@ -291,6 +295,9 @@ node test-tagging.mjs              # 22 条：标签类别 / 词表合成 / 对�
 node test-proactive.mjs            # 46 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
 node test-zip-backup.mjs           # 36 条：ZIP 往返 + 系统解压验证 + 备份保留
 node test-config-writable.mjs      # 8 条：Config 可写性（源码 13 段/65 叶子 volatile + live Schema 比对）
+node test-gif.mjs                  # 15 条：GIF 收集放宽 / 原始图池 / 发送位置 / sub_type
+node test-rawimage.mjs             # 8 条：原始图转交协议（/raw-image + [[qqimg:]] 对齐）
+node test-llm-call.mjs             # 7 条：prepareCall/stream 配置一致（防「config changed」回归）
 ```
 
 全部**不联网、不起进程、不碰 DSH**。`--real-cordis` 会自己去找
@@ -357,12 +364,48 @@ Config field "proactive.enabled" is not volatile
 
 ---
 
+## 动图（GIF）为什么以前是静态的，现在怎么修好的
+
+**症状**：群里收进来的 GIF 存到库里变成一张静图；发出去的 GIF 在 QQ 里也不会动。
+
+**两个各自独立的根因**（都已修）：
+
+1. **收进来的 GIF 丢帧** —— DSH 的附件服务 `@deepseek-ai/dsh-attachment-local` 会对每张图做
+   "归一化"：`canPassThroughNormalization()` 见到 `mediaType==='image/gif'` 或 `animated`
+   一律返回 false，然后 `encodingLadder()` 只产出 `image/webp`（有 alpha）或 `image/jpeg`。
+   所以 `ctx.attachments.readImage(ref)` 拿回来的**永远是单帧**。
+   修法：桥接进程本来就在下载原始 Buffer，它把原字节 POST 到插件的 `/dsh-qq-sticker/raw-image`
+   （best-effort，失败不影响聊天），插件按 token 落进"原始图池"（`src/rawstore.js`，
+   10 分钟 TTL）。ingest 优先用原始池的字节入库，GIF 的 28 帧就都留住了。
+
+2. **发出去的 GIF 是静态大图** —— 全链路（`qq_send_image` → guard 队列 → 桥接 `_applyImageOp`
+   → `onebot.sendImage`）以前**没有任何地方传 `sub_type`**，NapCat 就当普通图片发。
+   修法：`qq_send_image` 加可选参数 `subType`（0/1），一路透传到 image 段的 `sub_type`；
+   GIF + `subType:1` 时再补 `summary: '[动画表情]'`。
+
+**同时放宽的收集门槛**（原来会误杀动图）：
+
+| 项 | 原来 | 现在 |
+|---|---|---|
+| 表情最大边长 | 640px | **1920px** |
+| 表情最大字节 | 1.5MB | **10MB** |
+| GIF | 也受上面两条限制 | **完全不受限**（只受库的硬顶 12MB） |
+
+改的都是 `src/config.js` 的默认值 + `src/ingest.js` / `src/library.js` / `src/proactive.js`
+的判定。旧配置若显式写过 640/1572864，需要到设置页改一下（或留空用默认）。
+
+**怎么确认它在工作**：设置页「发送设置」→ 图片位置选「文字之后」，「按小表情发送」打开；
+概览页能看到库里有动图的张数。Console 里 `[qq-sticker] 收进表情 #xxxx` 会打出真实尺寸。
+
+---
+
 ## 已知限制
 
 | 限制 | 原因 | 出路 |
 |---|---|---|
-| 发表情显示成大图 | DSH 发送链不透传图片段的 `sub_type` | P2：桥接 `sendImage` + `qq_send_image` 各加一个可选参数 |
-| 动图只按首帧识别 | Host 侧没有图像库、本机没 ffmpeg | 需要时移植原插件的纯 JS GIF 解码 |
+| ~~发表情显示成大图~~ | ~~DSH 发送链不透传 `sub_type`~~ | ✅ 已修：`qq_send_image` 新增 `subType` 参数并透传到 NapCat |
+| ~~动图只按首帧识别~~ | ~~Host 侧没有图像库~~ | ✅ 已修：桥接转交原始字节 → 原始图池（GIF 保真） |
+| GIF 转码成别的格式 | Node 里没有图像库/ffmpeg | 只做「发送时标记」，不做真实转码 |
 | 商城表情（mface）不入库 | 桥接把 `mface` 段转成文本 `[表情]`，没有图 | 需要改桥接保留原段 |
 | 无法同步 QQ 收藏 | DSH 侧没有 `fetch_custom_face_detail` | 需要桥接/qq-guard 开只读通道 |
 

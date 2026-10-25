@@ -195,9 +195,20 @@ await check('大尺寸照片不算表情包', () => {
   assert.equal(looksLikeSticker(makeItem({ width: 3000, height: 2000 }), cfg), false)
 })
 
-await check('大字节不算表情包', () => {
+await check('大字节（超 10MB 上限）不算表情包', () => {
   const cfg = readConfig({})
-  assert.equal(looksLikeSticker(makeItem({ bytes: 8 * 1024 * 1024 }), cfg), false)
+  assert.equal(looksLikeSticker(makeItem({ bytes: 11 * 1024 * 1024 }), cfg), false)
+})
+
+await check('放宽后：8MB 的图仍算表情包（以前会被 1.5MB 上限误杀）', () => {
+  const cfg = readConfig({})
+  assert.equal(looksLikeSticker(makeItem({ width: 800, height: 800, bytes: 8 * 1024 * 1024 }), cfg), true)
+})
+
+await check('放宽后：1920px 内的图算表情包，超过才算照片', () => {
+  const cfg = readConfig({})
+  assert.equal(looksLikeSticker(makeItem({ width: 1900, height: 1900, bytes: 900000 }), cfg), true)
+  assert.equal(looksLikeSticker(makeItem({ width: 1921, height: 1921, bytes: 900000 }), cfg), false)
 })
 
 await check('小图算表情包', () => {

@@ -34,6 +34,7 @@ import { buildCandidateContext, CONTEXT_NAME, listLine } from './src/prompt.js'
 import { buildTools, TOOL_NAMES, toolsBrief } from './src/tools.js'
 import { emptyState } from './src/gate.js'
 import { registerRoutes } from './src/server.js'
+import { RawImageStore } from './src/rawstore.js'
 
 export const name = 'dsh-qq-sticker'
 
@@ -118,6 +119,8 @@ export function createRuntime(ctx, config) {
     backup: null,
     attachments: null,
     readImageBytes: null,
+    /** 桥接转交的原始图池（GIF 动画保真；见 src/rawstore.js）。 */
+    rawImages: null,
     guards: {},
     toolNames: TOOL_NAMES,
     toolDefs: [],
@@ -129,6 +132,7 @@ export function createRuntime(ctx, config) {
 
   runtime.library = new Library({ dataDir, config: getConfig(), log })
   runtime.tracker = new SessionTracker()
+  runtime.rawImages = new RawImageStore({ dir: path.join(dataDir, 'raw'), log })
 
   /**
    * 应用最终数据目录（异步解析结果）。
@@ -148,6 +152,10 @@ export function createRuntime(ctx, config) {
     runtime.stateFile = path.join(target, FILES.state)
     runtime.storeNote = note
     runtime.library = new Library({ dataDir: target, config: getConfig(), log })
+    // 原始图池跟着数据目录走（它是临时池，不需要搬迁旧内容）
+    void runtime.rawImages?.relocate(path.join(target, 'raw')).catch((error) => {
+      log('warn', `原始图池换目录失败：${error?.message ?? error}`)
+    })
     const saver = makeStateSaver(runtime.stateFile, () => state, log)
     runtime.markStateDirty = () => saver.mark()
     runtime.flushState = () => saver.flush()
@@ -157,25 +165,42 @@ export function createRuntime(ctx, config) {
   runtime.attachments = getAttachments()
 
   /**
-   * 读图字节。两种 ref 都吃：
-   *  · 入站消息里的 ImageAttachmentRef（有 attachmentId）→ ctx.attachments.readImage
-   *  · 本插件库里的本地路径 → 直接读文件
-   */
-  runtime.readImageBytes = async (ref) => {
+   * 读图字节。三种来源，按优先级：
+   *  ① **原始图池**（桥接转交的未转码字节）—— 只有这条路能拿到动图帧；
+   *  ② 入站消息里的 ImageAttachmentRef（有 attachmentId）→ ctx.attachments.readImage；
+   *  ③ 本插件库里的本地路径 → 直接读文件。
+   */  runtime.readImageBytes = async (ref) => {
     if (!ref) return null
     if (typeof ref === 'string') {
+      // 支持 `raw:<token>` 伪引用（内部用；避免再猜路径）
+      if (ref.startsWith('raw:')) {
+        const hit = await runtime.rawImages?.take(ref.slice(4))
+        return hit ? { data: hit.data, mediaType: hit.mediaType, fromRaw: true } : null
+      }
       const info = await fileInfo(ref)
       if (!info.exists) return null
       const data = await readFile(ref)
       const sniff = sniffImage(data)
       return sniff ? { data: new Uint8Array(data), mediaType: sniff.mediaType } : null
     }
+    // ① 原始池优先：GIF 只有这里还是动图
+    const rawToken = pickRawToken(ref)
+    if (rawToken) {
+      const hit = await runtime.rawImages?.take(rawToken)
+      if (hit) return { data: hit.data, mediaType: hit.mediaType, fromRaw: true, rawToken }
+    }
     const attachments = getAttachments()
     if (attachments && typeof attachments.readImage === 'function') {
       try {
         const stored = await attachments.readImage(ref)
         if (stored?.data) {
-          return { data: stored.data, mediaType: stored.ref?.mediaType ?? ref.mediaType ?? 'image/jpeg' }
+          const mediaType = stored.ref?.mediaType ?? ref.mediaType ?? 'image/jpeg'
+          // ② 拿回来的若不是原类型（典型：GIF 被归一化成 webp），再试一次原始池
+          if (rawToken && mediaType !== ref.mediaType) {
+            const again = await runtime.rawImages?.take(rawToken)
+            if (again) return { data: again.data, mediaType: again.mediaType, fromRaw: true, rawToken }
+          }
+          return { data: stored.data, mediaType }
         }
       } catch (error) {
         log('warn', `读附件失败（${ref.attachmentId ?? '?'}）：${error?.message ?? error}`)
@@ -312,6 +337,11 @@ export function startLifecycle(ctx, runtime) {
         await mkdir(path.join(runtime.dataDir, FILES.images), { recursive: true })
         await loadStateFile(runtime)
         await runtime.library.load()
+        // 原始图池重建索引：重启后有效期内还没过期的条目要能被认出来
+        // （桥接那边 token 是一次性的，但同一进程里可能已写过；重启后一般已过期，扫一遍即可）
+        await runtime.rawImages?.load?.().catch((error) => {
+          log('warn', `原始图池索引重建失败（不影响收图）：${error?.message ?? error}`)
+        })
         await runtime.collector.loadSchedule()
         await runtime.library.pruneMissingFiles()
         runtime.library.config = runtime.getConfig()
@@ -459,6 +489,9 @@ export function startLifecycle(ctx, runtime) {
 
       if (!cfg.collect.enabled) return
       const content = Array.isArray(message.content) ? message.content : []
+      // 桥接在 prompt 文本里留了 `[[qqimg:<token>]]`（每张图一行，按顺序），
+      // 这里把 token 挂到对应的 image 块上：ingest 拿到它就能取原始字节（GIF 保真）。
+      attachRawTokens(content, runtime.rawImages)
       const result = runtime.ingestor.onUserMessage({
         sessionId,
         content,
@@ -673,16 +706,19 @@ async function chatText(ctx, { prompt, modelHint, maxTokens, temperature }, runt
     ?? resolveChatRoute(ctx, cfg, cfg.vision.providerId, cfg.vision.model)
   if (!route) throw new Error('拿不到可用的模型路由')
 
+  // ⚠️ prepareCall 与 stream 必须拿到字段完全相同的 config，
+  //    否则 DSH 会在派发前抛 `prepared LLM call config changed`。详见 buildCallConfig。
+  const callConfig = buildCallConfig(route, {
+    maxTokens: num(maxTokens, 200),
+    temperature: num(temperature, 0.3),
+  })
   const prepared = typeof llm.prepareCall === 'function'
-    ? await llm.prepareCall({ provider: route.provider, model: route.model })
+    ? await llm.prepareCall(callConfig)
     : null
 
   const options = {
-    provider: route.provider,
-    model: route.model,
+    ...callConfig,
     messages: [{ role: 'user', content: [{ type: 'text', text: String(prompt ?? '') }] }],
-    maxTokens: num(maxTokens, 200),
-    temperature: num(temperature, 0.3),
   }
 
   const stream = prepared ? prepared.stream(options) : llm.stream(options)
@@ -730,10 +766,12 @@ async function sendItemNow(ctx, runtime, item) {
 
   let result
   try {
+    const cfg = runtime.getConfig()
+    const subType = cfg.send.sendAsSticker === false ? 0 : (cfg.send.subType === 0 ? 0 : 1)
     result = await tools.execute({
       callId: `sticker-proactive-${Date.now().toString(36)}`,
       name: 'qq_send_image',
-      arguments: { file: pathToFileURLSafe(item.path) },
+      arguments: { file: pathToFileURLSafe(item.path), subType },
       agent,
       signal: AbortSignal.timeout(30_000),
     })
@@ -790,26 +828,107 @@ function pathToFileURLSafe(filePath) {
   return pathToFileURL(String(filePath)).href
 }
 
+/**
+ * 从附件 ref 上找桥接给的原始图 token。
+ *
+ * 桥接在 prompt 文本里塞了 `[[qqimg:<token>]]`，插件把 token 解析出来挂到
+ * 每个 image 块上（见 attachRawTokens）。这里只管取。
+ *
+ * @param {object} ref ImageAttachmentRef（可能带 rawToken）
+ * @returns {string|undefined}
+ */
+function pickRawToken(ref) {
+  const direct = String(ref?.rawToken ?? '').trim()
+  if (direct) return direct
+  // 兜底：某些实现把 token 直接塞进 attachmentId（不走标准 ref 时）
+  const id = String(ref?.attachmentId ?? '')
+  return id.startsWith('raw:') ? id.slice(4) : undefined
+}
+
+/**
+ * 把文本里的 `[[qqimg:<token>]]` 标记按顺序挂到消息的 image 块上（原地改）。
+ *
+ * 为什么这么设计：桥接没法直接往 attachment ref 上加字段（ref 是 DSH 的公开类型，
+ * 多塞字段会被 admission 校验拒）。所以它把 token 写进 prompt 文本，插件这边
+ * 用「文本里出现顺序 == 图片块出现顺序」对齐。这是唯一不改 DSH 协议的办法。
+ *
+ * 只在池子里真有这个 token 时才挂（避免把垃圾标记当成有效引用）。
+ *
+ * @param {Array<object>} content 消息 content blocks
+ * @param {{peek:(token:string)=>object|null}} [store] 原始图池
+ * @returns {number} 成功挂上的张数
+ */
+function attachRawTokens(content, store) {
+  if (!Array.isArray(content) || !store || typeof store.peek !== 'function') return 0
+  const tokens = []
+  for (const block of content) {
+    if (block?.type !== 'text' || typeof block.text !== 'string') continue
+    for (const token of RawImageStore.tokensInText(block.text)) {
+      // 只认真实存在的（过期的、伪造的都跳过）
+      if (store.peek(token)) tokens.push(token)
+    }
+  }
+  if (tokens.length === 0) return 0
+  let index = 0
+  let attached = 0
+  for (const block of content) {
+    if (block?.type !== 'image' || !block.attachment) continue
+    if (index >= tokens.length) break
+    block.attachment.rawToken = tokens[index++]
+    attached++
+  }
+  return attached
+}
+
+/**
+ * 组装一次 LLM 调用的**完整配置**，供 prepareCall 与 stream 共用。
+ *
+ * ⚠️ 为什么必须两边一模一样（2026-10-25 真机踩过，报错原文：
+ * `prepared LLM call config changed before adapter dispatch`）：
+ *
+ *   DSH 的 `llm.prepareCall(config)` 会先按 config 算出 `resolved.config`，
+ *   然后 `prepared.stream(options)` 里做一次逐字段比对
+ *   （dsh-llm/lib/index.js `callConfigEquals`，比 provider / model /
+ *   reasoningEffort / temperature / maxTokens / stop）。只要有一个字段对不上就抛
+ *   `INVALID_PREPARED_CALL`。
+ *
+ *   我们以前只把 `{provider, model}` 交给 prepareCall，却把
+ *   `temperature` / `maxTokens` 只塞进 stream 的 options ——
+ *   resolved 里没有这两个字段，比对必然失败，**每一张图都报这个错**。
+ *
+ *   这跟 qq-guard 的 `agent/request` 拦截器无关：那条瀑布只改普通聊天回合的
+ *   provider/model，插件自己发起的 `prepareCall` 根本不经过它。
+ *
+ * @param {{provider:string, model:string}} route
+ * @param {{maxTokens?:number, temperature?:number}} [controls]
+ * @returns {object} 字段完全相同的一份 config（prepareCall 与 stream 都用它）
+ */
+function buildCallConfig(route, controls = {}) {
+  const config = { provider: route.provider, model: route.model }
+  const maxTokens = num(controls.maxTokens, 0)
+  const temperature = controls.temperature
+  if (maxTokens > 0) config.maxTokens = Math.round(maxTokens)
+  if (temperature !== undefined && Number.isFinite(Number(temperature))) {
+    config.temperature = Number(temperature)
+  }
+  return config
+}
+
 /** 用 LLM 通道发一次多模态请求，返回正文。 */
 async function chatWithImages(ctx, { prompt, imageRefs, providerId, model, maxTokens, temperature }, runtime, log) {
   const llm = safeService(ctx, 'llm')
   if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有 llm 服务，看不了图')
   const route = resolveChatRoute(ctx, runtime.getConfig(), providerId, model)
   if (!route) throw new Error('拿不到可用的模型路由（设置里指定 providerId/model，或确保会话有默认模型）')
+  const callConfig = buildCallConfig(route, { maxTokens, temperature })
   const prepared = typeof llm.prepareCall === 'function'
-    ? await llm.prepareCall({ provider: route.provider, model: route.model })
+    ? await llm.prepareCall(callConfig)
     : null
   const content = [{ type: 'text', text: prompt }]
   for (const ref of imageRefs ?? []) {
     if (ref) content.push({ type: 'image', attachment: ref })
   }
-  const options = {
-    provider: route.provider,
-    model: route.model,
-    messages: [{ role: 'user', content }],
-    maxTokens: num(maxTokens, 2600),
-    temperature: num(temperature, 0.2),
-  }
+  const options = { ...callConfig, messages: [{ role: 'user', content }] }
   const stream = prepared ? prepared.stream(options) : llm.stream(options)
   let text = ''
   let failure = ''

@@ -69,6 +69,12 @@ window.__ModuleLoader__.load({
       { value: 'prefetch', label: '并发检索', desc: '生成期间先预取候选（更省时间，判断仍在回合末）' },
     ]
 
+    /** 图片相对文字的位置（v2.1）。 */
+    const IMAGE_POSITION_OPTIONS = [
+      { value: 'after', label: '文字之后', desc: '等文字发完再补图（默认，和现有发送链一致）' },
+      { value: 'before', label: '文字之前', desc: '先发图再发文字（需要桥接延迟队列配合）' },
+    ]
+
     /**
      * 配置字段元数据。
      *
@@ -78,14 +84,14 @@ window.__ModuleLoader__.load({
      */
     const FIELDS = [
       // ── 发送 ──────────────────────────────────────
-      { path: 'send.frequency', label: '配图频率', type: 'select', options: FREQ_OPTIONS, section: 'send', primary: true },
-      { path: 'send.minIntervalSec', label: '单群间隔', type: 'number', min: 0, max: 3600, unit: '秒', section: 'send', primary: true, desc: '同一群两次发表情至少隔多久' },
+      { path: 'send.frequency', label: '配图频率', type: 'select', options: FREQ_OPTIONS, section: 'send', primary: true },      { path: 'send.minIntervalSec', label: '单群间隔', type: 'number', min: 0, max: 3600, unit: '秒', section: 'send', primary: true, desc: '同一群两次发表情至少隔多久' },
       { path: 'send.globalIntervalSec', label: '全局间隔', type: 'number', min: 0, max: 3600, unit: '秒', section: 'send', primary: true, desc: '不分群，两次发表情之间至少隔多久' },
       { path: 'send.dailyLimit', label: '每日上限', type: 'number', min: 0, max: 2000, unit: '张', section: 'send', primary: true, desc: '所有群合计，0 = 不限' },
       { path: 'send.keepRecentCount', label: '每轮候选数', type: 'number', min: 1, max: 8, unit: '张', section: 'send', group: 'context', desc: '给模型挑的范围，太少挑不到、太多挑花眼' },
       { path: 'send.showTextInContext', label: '候选带图上的文字', type: 'switch', section: 'send', group: 'context', desc: '挑得更准，关掉省一点 token' },
       { path: 'send.sendAsSticker', label: '按小表情发送', type: 'switch', section: 'send', group: 'context', desc: '当前桥接未透传 sub_type，打开也发大图' },
-      { path: 'send.subType', label: '图片段 sub_type', type: 'number', min: 0, max: 1, section: 'send', group: 'context', desc: '1 = 表情，0 = 普通图片；等桥接支持后生效' },
+      { path: 'send.subType', label: '图片段 sub_type', type: 'number', min: 0, max: 1, section: 'send', group: 'context', desc: '1 = 表情（QQ 里显示为小表情，可长按收藏），0 = 普通图片' },
+      { path: 'send.imagePosition', label: '图片位置', type: 'select', options: IMAGE_POSITION_OPTIONS, section: 'send', group: 'context', desc: '图和文字哪个先发；桥接不支持时按「文字之后」处理' },
       { path: 'send.adminOnly', label: '仅管理员可改库', type: 'switch', section: 'send', group: 'permission', desc: '关掉则任何人能让机器人整理' },
       { path: 'send.adminIds', label: '额外管理员 QQ', type: 'text', placeholder: '逗号分隔', section: 'send', group: 'permission', desc: '即使不是群管也授权' },
 
@@ -155,7 +161,7 @@ window.__ModuleLoader__.load({
       { path: 'backup.deflate', label: '压缩备份', type: 'switch', section: 'backup', group: 'schedule', desc: '图片已压过，开了体积差不多但更费 CPU' },
 
       // ── v2：存储与格式（放 advanced）─────────────────
-      { path: 'store.dataDir', label: '自定义存储目录', type: 'text', placeholder: '绝对路径，留空用默认', section: 'advanced', group: 'storage', desc: '⚠️ 改完要重启 DSH 才生效；新目录为空时会自动搬迁现有库' },
+      { path: 'store.dataDir', label: '自定义存储目录', type: 'path', placeholder: '绝对路径，留空用默认', section: 'advanced', group: 'storage', desc: '改完要重启 DSH 才生效；新目录为空时会自动搬迁现有库' },
       { path: 'gif.normalizeOnSend', label: '发送时统一格式', type: 'switch', section: 'advanced', group: 'misc', desc: '⚠️ Node 无图像库，只做标记与统计，不做真实转码' },
 
       { path: 'enabled', label: '插件总开关', type: 'switch', section: 'advanced', group: 'misc', desc: '关掉后不收图、不进提示词、工具全拒（库不删）' },
@@ -202,6 +208,7 @@ window.__ModuleLoader__.load({
       'send.showTextInContext': true,
       'send.sendAsSticker': true,
       'send.subType': 1,
+      'send.imagePosition': 'after',
       'send.adminOnly': true,
       'send.adminIds': '',
       'prompt.encourage': 3,
@@ -599,6 +606,20 @@ window.__ModuleLoader__.load({
 .qqs-model .qqs-select { width: 232px; }
 .qqs-model .qqs-input { width: 232px; }
 .qqs-model-hint { font-size: 10.5px; color: var(--qqs-ink-2); text-align: right; max-width: 232px; }
+
+/* ── 路径输入（存储目录）───────────────────────────────────── */
+.qqs-path { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.qqs-path-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.qqs-path-input {
+  flex: 1 1 260px; width: auto; min-width: 180px; max-width: 520px;
+  font-family: var(--ds-font-family-code, Consolas, ui-monospace, monospace);
+  font-size: 11.5px;
+}
+.qqs-path-hint { font-size: 10.5px; line-height: 1.5; color: var(--qqs-ink-2); }
+.qqs-path-default { font-size: 10.5px; color: var(--qqs-ink-2); display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+/* ── 本地文件夹卡（操作页顶上）─────────────────────────────── */
+.qqs-card .qqs-inline > .qqs-btn { margin-left: 0; }
 
 /* ── 多行文本（tags）与整行控件（模型选择）────────────────────
    不能塞进行右列，改成单列：说明在上、控件占满整行。 */
@@ -1019,6 +1040,19 @@ window.__ModuleLoader__.load({
       heart: [
         ['path', { d: 'M12 19.5s-7-4.3-7-9a3.8 3.8 0 0 1 7-2.1 3.8 3.8 0 0 1 7 2.1c0 4.7-7 9-7 9z' }],
       ],
+      folder: [
+        ['path', { d: 'M4 7.5a2 2 0 0 1 2-2h3.2a2 2 0 0 1 1.6.8l1 1.4H18a2 2 0 0 1 2 2v6.8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z' }],
+      ],
+      image: [
+        ['rect', { x: 4, y: 5, width: 16, height: 14, rx: 2 }],
+        ['circle', { cx: 9, cy: 10, r: 1.4 }],
+        ['path', { d: 'M5 17l4.5-4.5 3 3 2.5-2.5L20 18' }],
+      ],
+      download: [
+        ['path', { d: 'M12 4v10' }],
+        ['path', { d: 'M8 11l4 4 4-4' }],
+        ['path', { d: 'M5 19h14' }],
+      ],
     }
 
     function Glyph({ name, size = 16 }) {
@@ -1162,6 +1196,30 @@ window.__ModuleLoader__.load({
       if (res.status === 409) return { ok: false, reason: 'already-running', job: body?.job }
       if (!res.ok || body?.ok !== true) throw new Error(body?.reason ?? `HTTP ${res.status}`)
       return { ok: true, job: body.job }
+    }
+
+    /**
+     * 让系统文件管理器打开插件的数据目录。
+     *
+     * 走插件自己的 Host 路由 `/open-path`（浏览器页面没有 shell 权限，
+     * 而宿主的 openWorkspacePath 只认工作区内的路径，数据目录在 ~/.dsh 下）。
+     *
+     * @param {{sub?:string}} [options] sub = 子目录（如 'images' / 'backups'）
+     * @returns {Promise<{ok:boolean, path?:string, reason?:string}>}
+     */
+    async function openDataFolder(options = {}) {
+      const res = await fetch(`${API}/open-path`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ sub: options.sub ?? '' }),
+      })
+      let body = {}
+      try { body = await res.json() } catch { /* 空响应 */ }
+      if (!res.ok || body?.ok !== true) {
+        throw new Error(body?.reason ?? `HTTP ${res.status}`)
+      }
+      return body
     }
 
     /**
@@ -1921,6 +1979,72 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * 路径输入框 + 「浏览」按钮（高级设置里的存储目录用）。
+     *
+     * 「浏览」不弹系统原生目录选择器（浏览器页面没这个能力），而是：
+     *   ① 打开当前生效的数据目录，让用户先在资源管理器里看/建目标目录；
+     *   ② 同时把「可填的绝对路径」示例和「需要重启」的提示显示在下方。
+     * 用户把路径粘进输入框、失焦提交 → 走正常配置写回（热写入 profile）。
+     */
+    function PathField({
+      value, placeholder, disabled, onCommit, ariaLabel, hint, defaultPath,
+      onBrowse, onReset,
+    }) {
+      const text = String(value ?? '')
+      const [draft, setDraft] = React.useState({ focused: false, text })
+      const shown = draft.focused ? draft.text : text
+      const commit = () => {
+        const next = draft.text.trim()
+        setDraft({ focused: false, text: next })
+        if (next !== text) onCommit(next)
+      }
+      const changed = text !== '' && text !== String(defaultPath ?? '')
+
+      return h('div', { className: 'qqs-path' },
+        h('div', { className: 'qqs-path-row' },
+          h('input', {
+            type: 'text',
+            className: 'qqs-input qqs-path-input',
+            value: shown,
+            placeholder,
+            disabled: disabled === true,
+            spellCheck: false,
+            'aria-label': ariaLabel,
+            onFocus: () => setDraft({ focused: true, text }),
+            onChange: (event) => setDraft({ focused: true, text: event.target.value }),
+            onBlur: commit,
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() }
+              if (event.key === 'Escape') setDraft({ focused: false, text })
+            },
+          }),
+          h(Button, {
+            size: 'sm',
+            icon: 'folder',
+            disabled: disabled === true,
+            title: '在资源管理器里打开当前生效的数据目录',
+            onClick: onBrowse,
+          }, '浏览'),
+          changed
+            ? h(Button, {
+              size: 'sm',
+              variant: 'ghost',
+              disabled: disabled === true,
+              title: '清空自定义路径，回到默认目录',
+              onClick: () => { setDraft({ focused: false, text: '' }); onReset?.() },
+            }, '恢复默认')
+            : null),
+        h('div', { className: 'qqs-path-hint' },
+          changed
+            ? '⚠️ 保存后需重启 DSH 才生效；新目录为空时会把现有库自动搬过去。'
+            : (hint || '留空 = 默认目录（插件数据目录）。')),
+        defaultPath
+          ? h('div', { className: 'qqs-path-default' },
+            '当前默认：', h('span', { className: 'qqs-code', title: defaultPath }, defaultPath))
+          : null)
+    }
+
     function StatCard({ label, value, unit, hint, tone }) {
       const cls = ['qqs-card', 'qqs-stat']
       if (tone) cls.push(`qqs-stat-tone-${tone}`)
@@ -2127,7 +2251,7 @@ window.__ModuleLoader__.load({
 
     // ───────────────────────────────────────────── 概览
 
-    function StatusTab({ data, onGoto }) {
+    function StatusTab({ data, onGoto, onOpenError }) {
       if (!data) return h(Empty, { title: '还没有数据', desc: '等第一次状态轮询完成；如果一直停在加载中，看顶部错误提示。' })
 
       const library = data.library ?? {}
@@ -2279,8 +2403,21 @@ window.__ModuleLoader__.load({
               }, h('span', { className: 'qqs-muted' }, data.gif.lastMarkedAt ? fmtTime(data.gif.lastMarkedAt) : '—'))
               : null),
           data.dataDir
-            ? h('div', { className: 'qqs-card-desc' },
-              '数据目录：', h('span', { className: 'qqs-code', title: data.dataDir }, data.dataDir))
+            ? h('div', { className: 'qqs-card-desc qqs-inline' },
+              h('span', null, '数据目录：', h('span', { className: 'qqs-code', title: data.dataDir }, data.dataDir)),
+              h(Button, {
+                size: 'sm',
+                variant: 'ghost',
+                icon: 'folder',
+                title: '在资源管理器里打开这个目录',
+                onClick: async () => {
+                  try {
+                    await openDataFolder()
+                  } catch (error) {
+                    onOpenError?.(`打不开目录：${error?.message ?? error}`)
+                  }
+                },
+              }, '打开本地文件夹'))
             : null),
 
         data.tools && data.tools.length > 0
@@ -2476,6 +2613,47 @@ window.__ModuleLoader__.load({
             })
             : null,
 
+        // 本地文件：直接调系统资源管理器打开数据目录
+        h('div', { className: 'qqs-card' },
+          h('div', { className: 'qqs-card-head' },
+            h('div', { className: 'qqs-card-title' },
+              h('span', { className: 'qqs-card-title-icon' }, h(Glyph, { name: 'folder', size: 14 })),
+              '本地文件'),
+            h('div', { className: 'qqs-inline' },
+              h(Button, {
+                size: 'sm',
+                variant: 'primary',
+                icon: 'folder',
+                busy: busyKind === 'open-folder',
+                onClick: async () => {
+                  setBusyKind('open-folder')
+                  try {
+                    const result = await openDataFolder()
+                    onToast('ok', `已在资源管理器打开：${result.path ?? '数据目录'}`)
+                  } catch (error) {
+                    onToast('err', `打不开文件夹：${error?.message ?? error}`)
+                  } finally {
+                    setBusyKind('')
+                  }
+                },
+              }, '打开本地文件夹'),
+              h(Button, {
+                size: 'sm',
+                variant: 'ghost',
+                icon: 'image',
+                onClick: async () => {
+                  try {
+                    await openDataFolder({ sub: 'images' })
+                    onToast('ok', '已打开图片目录')
+                  } catch (error) {
+                    onToast('err', `打不开图片目录：${error?.message ?? error}`)
+                  }
+                },
+              }, '图片目录'))),
+          h('div', { className: 'qqs-card-desc' },
+            '直接跳到磁盘上看库里的图片文件。',
+            data?.dataDir ? ['目录：', h('span', { className: 'qqs-code', title: data.dataDir }, data.dataDir)] : '')),
+
         ACTIONS.map((action) => {
           const job = latestJob(jobs, action.kind)
           const isRunning = job?.status === 'running'
@@ -2620,7 +2798,7 @@ window.__ModuleLoader__.load({
 
     // ───────────────────────────────────────────── 设置
 
-    function ConfigTab({ form, catalog, onToast }) {
+    function ConfigTab({ form, catalog, data, onToast }) {
       const writer = useConfigWriter(form)
       const { snap, get, write, writable, saveError, savingCount } = writer
       // 默认全部收起：每个分类的常显区（primary 项）始终可见，
@@ -2711,6 +2889,25 @@ window.__ModuleLoader__.load({
             onChange,
             hint: field.desc,
           })
+        } else if (field.type === 'path') {
+          control = h(PathField, {
+            value,
+            placeholder: field.placeholder,
+            disabled,
+            ariaLabel: label,
+            hint: field.desc,
+            defaultPath: data?.store?.defaultDataDir ?? data?.dataDir ?? '',
+            onCommit: onChange,
+            onReset: () => onChange(''),
+            onBrowse: async () => {
+              try {
+                await openDataFolder()
+                onToast?.('ok', '已在资源管理器打开当前数据目录')
+              } catch (error) {
+                onToast?.('err', `打不开目录：${error?.message ?? error}`)
+              }
+            },
+          })
         } else if (field.type === 'number') {
           control = h(NumberField, {
             value,
@@ -2752,8 +2949,8 @@ window.__ModuleLoader__.load({
         const placeholder = unknownFieldHint(known, writable)
         const body = placeholder ?? control
 
-        // textarea / 模型选择太宽，塞在行右列会挤成一条缝 —— 单独整行渲染
-        if (field.type === 'textarea' || field.type === 'model') {
+        // textarea / 模型选择 / 路径输入太宽，塞在行右列会挤成一条缝 —— 单独整行渲染
+        if (field.type === 'textarea' || field.type === 'model' || field.type === 'path') {
           return h('div', { key: field.path, className: 'qqs-row qqs-row-block' + (known ? '' : ' qqs-row-unknown') },
             h('div', { className: 'qqs-row-main' },
               label,
@@ -3006,7 +3203,7 @@ window.__ModuleLoader__.load({
           : null,
 
         tab === 'status'
-          ? h(StatusTab, { data, onGoto: setTab })
+          ? h(StatusTab, { data, onGoto: setTab, onOpenError: (message) => pushToast('err', message) })
           : tab === 'actions'
             ? h(ActionsTab, {
               data,
@@ -3014,7 +3211,7 @@ window.__ModuleLoader__.load({
               onRefresh: refresh,
               onToast: pushToast,
             })
-            : h(ConfigTab, { form, catalog, onToast: pushToast })),
+            : h(ConfigTab, { form, catalog, data, onToast: pushToast })),
         h(Toasts, { items: toasts, onDismiss: dismissToast }))
     }
 

@@ -38,6 +38,11 @@ export function effectiveDimensions(ref) {
  * 判错方向的代价不对称：把照片当表情收进来，只是库里多一张没用的；
  * 把表情漏掉，这个功能就废了。所以偏宽松 —— 只在**明确像照片**时才排除。
  *
+ * 动图（GIF/动 WebP）一律放行，**不受尺寸与字节限制**：
+ *  - QQ 里 GIF 就是表情，没人拿 GIF 当照片；
+ *  - DSH 附件服务会把 GIF 重编码成单帧，字节数和尺寸都与原图对不上，
+ *    拿这些归一化后的数字去判"像不像表情"，只会把动图误杀。
+ *
  * @param {object} meta { mediaType, width, height, bytes }
  * @param {object} config 归一化配置
  */
@@ -47,7 +52,7 @@ export function isLikelySticker(meta, config) {
   const width = Math.max(0, num(meta?.width, 0))
   const height = Math.max(0, num(meta?.height, 0))
 
-  // 动图几乎都是表情（QQ 里没人用 GIF 当照片）
+  // 动图几乎都是表情（QQ 里没人用 GIF 当照片）；尺寸/容量都不设门槛
   if (mediaType === 'image/gif') return true
   // 尺寸未知时按"像表情"放行（判定不了就别误杀）
   if (!width || !height) return bytes <= config.collect.stickerMaxBytes
@@ -206,9 +211,11 @@ export class Ingestor {
       chatKey: job.chatKey,
       srcHint: job.hint,
       source: 'observed',
-      width: job.ref.width,
-      height: job.ref.height,
-      mediaType: job.ref.mediaType,
+      // ⚠️ 原始池命中时不要用 ref 上报的宽高：那些是 DSH 归一化后的尺寸，
+      //    对 GIF 完全对不上。让 library 从真实字节里读尺寸。
+      width: stored.fromRaw ? undefined : job.ref.width,
+      height: stored.fromRaw ? undefined : job.ref.height,
+      mediaType: stored.fromRaw ? stored.mediaType : job.ref.mediaType,
     })
     if (!result.ok) {
       if (result.reason !== 'duplicate') this.log('debug', `未收：${result.reason}`)

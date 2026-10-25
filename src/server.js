@@ -16,6 +16,8 @@
  * 为什么只读路由的 register 闭包不复用到写路由：那个闭包把非 GET/HEAD 一律 405，
  * 写路由需要自己的方法判断（405 只对"方法不对"的写路由生效）。
  */
+import pathUtil from 'node:path'
+import { mkdir as fsMkdir, stat as fsStat } from 'node:fs/promises'
 import { num, safeService } from './util.js'
 
 /** 路由前缀（改这里要同步 README）。 */
@@ -23,6 +25,13 @@ export const ROUTE_PREFIX = '/dsh-qq-sticker'
 
 /** 写路由的请求体上限：动作参数都是小 JSON，64KB 足够，且能挡住拿大 body 拖死 Host。 */
 const MAX_BODY_BYTES = 64 * 1024
+
+/**
+ * 原始图片上传上限。
+ * 单张硬顶 12MB（与 library.maxItemMB 的硬顶一致），base64 膨胀约 1.34 倍，
+ * 再留一点 JSON 包装的余量 → 18MB。
+ */
+const MAX_RAW_IMAGE_BYTES = 18 * 1024 * 1024
 
 /**
  * 注册路由。
@@ -107,6 +116,11 @@ export function registerRoutes(ctx, runtime) {
       },
       // v2：主动发图汇总（跨会话统计 + 当前配置回显）
       proactive: safeBrief(() => proactiveBrief(runtime, cfg)),
+      // v2.1：原始图池（GIF 保真用；UI 排障会看）
+      rawPool: safeBrief(() => {
+        const stats = runtime.rawImages?.stats?.()
+        return { count: num(stats?.count, 0), bytes: num(stats?.bytes, 0) }
+      }) ?? { count: 0, bytes: 0 },
       jobs: runtime.jobs?.list?.() ?? [],
     })
   }, 'qq-sticker: state route')
@@ -149,6 +163,86 @@ export function registerRoutes(ctx, runtime) {
       sendJson(res, error?.statusCode ?? 500, { ok: false, reason: errorText(error) })
     }
   }, 'qq-sticker: config route')
+
+  // ── POST /raw-image：桥接转交的**原始图片字节** ─────────────────────
+  //
+  // 为什么需要这条路由：DSH 的附件服务（dsh-attachment-local）会把所有 GIF/动图
+  // 重新编码成**单帧** webp/jpeg —— `canPassThroughNormalization()` 对 gif / animated
+  // 一律返回 false，编码阶梯只产出 webp(有 alpha) 或 jpeg。所以插件从
+  // `ctx.attachments.readImage(ref)` 拿到的永远不是动图。
+  //
+  // 桥接本来就下载了原始 Buffer，它把原字节 POST 到这里，插件落盘成"原始图池"，
+  // 之后 ingest 优先用原始字节入库（GIF 才留得住动画），发送也用它。
+  //
+  // 约定：**best-effort**。桥接那边超时 1.5s、失败只 warn，绝不影响聊天；
+  // 这边同样任何异常都回 {ok:false}，不抛。
+  mount(`${ROUTE_PREFIX}/raw-image`, async (req, res) => {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+      return
+    }
+    if (!sameOrigin(req)) {
+      sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+      return
+    }
+    let body
+    try {
+      // 图可能到 10MB，base64 后约 13.3MB —— 这里必须比普通 JSON 路由宽
+      body = await readJsonBody(req, { maxBytes: MAX_RAW_IMAGE_BYTES })
+    } catch (error) {
+      sendJson(res, error?.statusCode ?? 400, { ok: false, reason: errorText(error) })
+      return
+    }
+    const store = runtime.rawImages
+    if (!store || typeof store.put !== 'function') {
+      sendJson(res, 503, { ok: false, reason: '原始图池未就绪（插件还在初始化？）' })
+      return
+    }
+    try {
+      const stored = await store.put({
+        token: body?.token,
+        mediaType: body?.mediaType,
+        ext: body?.ext,
+        dataB64: body?.dataB64,
+      })
+      sendJson(res, stored.ok ? 200 : 400, stored)
+    } catch (error) {
+      sendJson(res, 500, { ok: false, reason: errorText(error) })
+    }
+  }, 'qq-sticker: raw-image route')
+
+  // ── POST /open-path：在系统资源管理器里打开数据目录（或任意受控子目录）───
+  //
+  // 为什么要服务端中转：客户端（浏览器页面）不能直接调 `shell.openPath`／
+  // 也没有 Node 的 child_process 权限；宿主提供的是 `ctx.remote.session.openWorkspacePath`
+  // （Remote，只接受「工作区内的路径」）。数据目录在 ~/.dsh/plugin-data 下，
+  // 不在工作区内 —— 所以走插件自己的 Host 路由，由��端用系统命令打开。
+  //
+  // 安全：只允许打开 runtime.dataDir 及其子目录（不接受任意路径），
+  // 且必须在 POST + same-origin 下。
+  mount(`${ROUTE_PREFIX}/open-path`, async (req, res) => {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, reason: 'method not allowed' })
+      return
+    }
+    if (!sameOrigin(req)) {
+      sendJson(res, 403, { ok: false, reason: 'cross-site request refused' })
+      return
+    }
+    let body
+    try {
+      body = await readJsonBody(req, { maxBytes: MAX_BODY_BYTES })
+    } catch (error) {
+      sendJson(res, error?.statusCode ?? 400, { ok: false, reason: errorText(error) })
+      return
+    }
+    try {
+      const result = await openDataDir(req, runtime, body)
+      sendJson(res, result.status, result.payload)
+    } catch (error) {
+      sendJson(res, error?.statusCode ?? 500, { ok: false, reason: errorText(error) })
+    }
+  }, 'qq-sticker: open-path route')
 
   // ── POST /action：{ kind, args } → 启动任务 ────────────────────────────
   mount(`${ROUTE_PREFIX}/action`, async (req, res) => {
@@ -193,8 +287,96 @@ export function registerRoutes(ctx, runtime) {
 }
 
 /**
- * 兜底写配置：走 `settings.update('qq-sticker', patch)`。
+ * 在系统文件管理器里打开数据目录。
  *
+ * 只允许打开 `runtime.dataDir`（及其子目录，用 `sub` 指定），防止这条路由被
+ * 当成任意文件系统的打开器。`sub` 只能是单段目录名（不含分隔符与 `..`）。
+ *
+ * 打开方式按平台分派，全部用系统自带命令，不引任何依赖：
+ *   · win32 → `explorer.exe <path>`（explorer 对已存在目录会直接打开，返回码 1 是常态）
+ *   · darwin → `open <path>`
+ *   · 其它 → `xdg-open <path>`
+ *
+ * @returns {{status:number, payload:object}}
+ */
+async function openDataDir(req, runtime, body) {
+  const sub = String(body?.sub ?? '').trim()
+  if (sub && (!/^[A-Za-z0-9._-]+$/.test(sub) || sub === '.' || sub === '..')) {
+    return { status: 400, payload: { ok: false, reason: 'sub 只能是单段目录名' } }
+  }
+  const root = String(runtime.dataDir ?? '').trim()
+  if (!root) return { status: 503, payload: { ok: false, reason: '数据目录还没解析出来（插件仍在初始化）' } }
+
+  const target = sub ? pathUtil.join(root, sub) : root
+  // 兜底再确认一次：解析后的绝对路径必须以数据目录开头
+  const normalizedRoot = pathUtil.resolve(root)
+  const normalizedTarget = pathUtil.resolve(target)
+  const inside = normalizedTarget === normalizedRoot
+    || normalizedTarget.startsWith(`${normalizedRoot}${pathUtil.sep}`)
+  if (!inside) {
+    return { status: 403, payload: { ok: false, reason: '只允许打开插件自己的数据目录' } }
+  }
+
+  // 目录不存在就先建（备份目录、raw 池这些按需创建）
+  let exists = true
+  try {
+    await fsStat(normalizedTarget)
+  } catch {
+    exists = false
+  }
+  if (!exists) {
+    try {
+      await fsMkdir(normalizedTarget, { recursive: true })
+    } catch (error) {
+      return { status: 500, payload: { ok: false, reason: `目录不存在且创建失败：${errorText(error)}` } }
+    }
+  }
+
+  const opened = await spawnDetached(normalizedTarget)
+  return {
+    status: opened.ok ? 200 : 500,
+    payload: {
+      ok: opened.ok,
+      path: normalizedTarget,
+      method: opened.method,
+      ...(opened.ok ? {} : { reason: opened.reason }),
+    },
+  }
+}
+
+/** 起一个不等待的进程（打开文件管理器不该把 HTTP 请求挂住）。 */
+async function spawnDetached(target) {
+  const { spawn } = await import('node:child_process')
+  const platform = process.platform
+  const plan = platform === 'win32'
+    ? { cmd: 'explorer.exe', args: [target], method: 'explorer' }
+    : platform === 'darwin'
+      ? { cmd: 'open', args: [target], method: 'open' }
+      : { cmd: 'xdg-open', args: [target], method: 'xdg-open' }
+  return await new Promise((resolve) => {
+    let settled = false
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    try {
+      const child = spawn(plan.cmd, plan.args, { detached: true, stdio: 'ignore', windowsHide: false })
+      child.on('error', (error) => done({ ok: false, method: plan.method, reason: errorText(error) }))
+      // explorer.exe 打开成功也常返回 1，所以**只把 spawn 失败当失败**；
+      // 进程退出码只用于日志，不影响响应（否则 Windows 上永远报错）。
+      child.on('exit', () => done({ ok: true, method: plan.method }))
+      // 3 秒内没退出也算成功（detached 的 GUI 程序本来就长命）
+      const timer = setTimeout(() => done({ ok: true, method: plan.method }), 3000)
+      timer.unref?.()
+    } catch (error) {
+      done({ ok: false, method: plan.method, reason: errorText(error) })
+    }
+  })
+}
+
+/**
+ * 兜底写配置：走 `settings.update('qq-sticker', patch)`。 *
  * patch 必须**带上当前段的其它字段**再覆盖目标叶子，否则 settings 的层合并
  * 会把整段冲掉（契约 §5 的 `{ [path[0]]: { ...当前段, [path.at(-1)]: value } }`）。
  * settings 服务不可用 → 501 `{ok:false,reason}`（契约 §5 原文）。

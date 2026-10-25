@@ -30,8 +30,8 @@ export const DEFAULTS = {
     topCount: 10,
     maxPerHour: 10,
     stickerOnly: true,
-    stickerMaxDim: 640,
-    stickerMaxBytes: 1572864,
+    stickerMaxDim: 1920,
+    stickerMaxBytes: 10485760,
   },
 
   vision: {
@@ -56,6 +56,7 @@ export const DEFAULTS = {
     showTextInContext: true,
     sendAsSticker: true,
     subType: 1,
+    imagePosition: 'after',
     adminOnly: true,
     adminIds: '',
   },
@@ -147,7 +148,7 @@ export const Config = Schema.object({
       .description('图片总占用上限（MB）。与张数哪个先到算哪个。')
       .default(DEFAULTS.library.maxTotalMB).min(1).max(4000).volatile(),
     maxItemMB: Schema.number()
-      .description('单张图片大小上限（MB），超过直接不收（硬顶 12MB）。')
+      .description('单张图片大小上限（MB），超过直接不收。动图（GIF）放宽到硬顶 12MB。')
       .default(DEFAULTS.library.maxItemMB).min(1).max(12).volatile(),
     blockedIds: Schema.string()
       .description('永久剔除名单：填表情编号（#后面那串），逗号分隔。这些人永远不收、也不会进候选。')
@@ -180,10 +181,12 @@ export const Config = Schema.object({
       .description('只收表情包：按尺寸/格式/视觉判定过滤掉照片与截图。关掉则群里的图都收。')
       .default(DEFAULTS.collect.stickerOnly).volatile(),
     stickerMaxDim: Schema.number()
-      .description('只收表情包时，最长边不超过多少像素才算表情（照片通常更大）。')
-      .default(DEFAULTS.collect.stickerMaxDim).min(64).max(2048).volatile(),
+      .description('只收表情包时，最长边不超过多少像素才算表情（照片通常更大）。默认 1920，基本不会误杀聊天表情；'
+        + '动图（GIF）不受这一项限制。')
+      .default(DEFAULTS.collect.stickerMaxDim).min(64).max(4096).volatile(),
     stickerMaxBytes: Schema.number()
-      .description('只收表情包时，单张字节上限（比库的硬上限更严，用于判定「不像表情」）。')
+      .description('只收表情包时，单张字节上限（比库的硬上限更严，用于判定「不像表情」）。默认 10MB；'
+        + '动图（GIF）不受这一项限制。')
       .default(DEFAULTS.collect.stickerMaxBytes).min(1024).max(12582912).volatile(),
   }).description('自动收集').default(DEFAULTS.collect),
 
@@ -242,11 +245,15 @@ export const Config = Schema.object({
       .description('候选行里带上识别出的「图上的文字」，挑得更准（省一点 token 可关）。')
       .default(DEFAULTS.send.showTextInContext).volatile(),
     sendAsSticker: Schema.boolean()
-      .description('按「小表情」形式发送（小图、可长按收藏）。⚠️ 当前桥接未透传 sub_type，打开也只会发成大图。')
+      .description('按「小表情」形式发送：图片段带 sub_type=1，QQ 里显示为小表情而不是大图。关掉则按普通图片发（sub_type 跟着下项走）。')
       .default(DEFAULTS.send.sendAsSticker).volatile(),
     subType: Schema.number()
-      .description('写入图片段的 sub_type 值：1 = 表情，0 = 普通图片。等桥接支持后生效。')
+      .description('写入图片段的 sub_type 值：1 = 表情（QQ 里显示为小表情，可长按收藏），0 = 普通图片。')
       .default(DEFAULTS.send.subType).min(0).max(1).volatile(),
+    imagePosition: Schema.union(['after', 'before'])
+      .description('图片相对文字的位置：after = 等文字发完再发图（默认）；before = 先发图再发文字。'
+        + '需要桥接层的延迟队列配合，桥接不支持时按 after 处理。')
+      .default(DEFAULTS.send.imagePosition).volatile(),
     adminOnly: Schema.boolean()
       .description('只有管理员能改标签/整理清除：群主、群管理员、主人与下面填的 QQ 号。关掉则任何人都能让机器人整理。')
       .default(DEFAULTS.send.adminOnly).volatile(),
@@ -413,7 +420,7 @@ export function readConfig(raw) {
       topCount: Math.round(clamp(collect.topCount, 1, 60, DEFAULTS.collect.topCount)),
       maxPerHour: Math.round(clamp(collect.maxPerHour, 0, 999, DEFAULTS.collect.maxPerHour)),
       stickerOnly: collect.stickerOnly !== false,
-      stickerMaxDim: Math.round(clamp(collect.stickerMaxDim, 64, 2048, DEFAULTS.collect.stickerMaxDim)),
+      stickerMaxDim: Math.round(clamp(collect.stickerMaxDim, 64, 4096, DEFAULTS.collect.stickerMaxDim)),
       stickerMaxBytes: Math.round(clamp(collect.stickerMaxBytes, 1024, 12582912, DEFAULTS.collect.stickerMaxBytes)),
     },
     vision: {
@@ -436,7 +443,11 @@ export function readConfig(raw) {
       keepRecentCount: Math.round(clamp(send.keepRecentCount, 1, 8, DEFAULTS.send.keepRecentCount)),
       showTextInContext: send.showTextInContext !== false,
       sendAsSticker: send.sendAsSticker !== false,
-      subType: num(send.subType, DEFAULTS.send.subType) === 0 ? 0 : 1,
+      // 发送形态：sendAsSticker 关掉时强制 0（普通大图）；开着时按 subType 走，默认 1
+      subType: send.sendAsSticker === false
+        ? 0
+        : (num(send.subType, DEFAULTS.send.subType) === 0 ? 0 : 1),
+      imagePosition: send.imagePosition === 'before' ? 'before' : 'after',
       adminOnly: send.adminOnly !== false,
       adminIds: stringOfList(send.adminIds),
     },
