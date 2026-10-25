@@ -1,0 +1,24 @@
+# ============================================================================
+# dsh-qq-sticker —— bundle patch
+# ============================================================================
+# 只插 **一条 profile 顶层行**。
+#
+# 为什么不插到 qq-chat preset 里（q.qq-guard 那样拆两行）：
+#   ① 带 id 的 insert 只能插进 `group: true` 的组行，qq-chat 是 agent-preset 的
+#      普通插件行，插不进去（patch 会 warn "not a group" 后跳过）；
+#   ② 本插件**不注册 tools.guard**，没有"顶层 guard 锁死浏览器会话"的风险；
+#   ③ 顶层行才拿得到 Config（设置页）与 webServer（状态路由）。
+#
+# 工具只对 QQ 会话可见的实现方式是 index.js 里的 `agent/created`：
+# 判定该 agent 的 preset 是 qq-chat 之后，往**它自己的 ctx** 注册。
+#
+# 安装：plugin_manager install_bundle，target = 本包目录绝对路径。
+# 改动 Host 侧代码（index.js / src）后必须重启 DSH 才生效。
+# ============================================================================
+
+- insert:
+    - id: qq-sticker
+      name: '@local/dsh-qq-sticker'
+      config:
+        enabled: true
+        debug: false

@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 运行时数据（插件真机上写出来的库、索引、备份都落在这里）
+plugin-data/
+
+# 日志
+*.log
+
+# 打包产物
+*.zip
+
+# 手工改文件前的临时备份（repo 里已经有一堆 *.bak-*，统一挡住）
+*.bak
+*.bak-*
+
+# 编辑器 / 系统杂物
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 开发期临时目录（跑测试生成的 tmp）
+.tmp/
+coverage/

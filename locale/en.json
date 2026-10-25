@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "title": "QQ Sticker Library",
+    "description": "Collects stickers posted in QQ groups, tags them with vision, and uses them naturally in chat. Has its own sidebar panel: library overview, one-click organize / cleanup / clear, and grouped settings. Merges five SnowLuma sticker plugins.",
+    "panel": {
+      "title": "QQ Sticker Library",
+      "status": "Overview",
+      "actions": "Actions",
+      "config": "Settings"
+    }
+  }
+}
