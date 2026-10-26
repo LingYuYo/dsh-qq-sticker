@@ -228,6 +228,9 @@ export function createActions({ runtime, jobs, log } = {}) {
           already: num(result?.already, 0),
           failed: num(result?.failed, 0),
           stopReason: String(result?.stopReason ?? ''),
+          // ⚠️ 把回扫诊断原样带出来。「considered=0」光看这个数字没法判断是
+          //    没会话、没消息、还是消息里没图片块 —— 排障全靠这几个计数。
+          ...(result?.diag ? { diag: result.diag } : {}),
         }
       },
     },

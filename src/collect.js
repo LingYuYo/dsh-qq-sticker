@@ -12,6 +12,7 @@
 import { createLimiter, num, oneLine, readJson, safeService, todayKey, writeJsonAtomic } from './util.js'
 import { FILES } from './library.js'
 import { shortId } from './library.js'
+import { attachRawTokens } from './rawtoken.js'
 
 /** 单次收集最多下载几张候选（按频率排序后截断）。 */
 const MAX_CANDIDATES = 60
@@ -161,14 +162,27 @@ export class Collector {
     if (!cfg.enabled) return { ok: false, reason: '插件已关闭' }
     if (this._running) return { ok: false, reason: '已经有一轮收集在跑' }
     this._running = true
-    const out = { ok: true, reason, considered: 0, collected: 0, already: 0, failed: 0, stopReason: '', items: [] }
+    const out = {
+      ok: true, reason, considered: 0, collected: 0, already: 0, failed: 0, stopReason: '', items: [],
+      // 诊断：读不到候选时，光看 considered=0 没法判断是"没会话""没消息"还是"没图片块"
+      diag: { sessions: 0, messages: 0, imageBlocks: 0, skippedSelf: 0, skippedByWindow: 0, sessionsWithImages: 0 },
+    }
     try {
       const windowHours = Math.max(1, Math.round(num(hours, cfg.collect.topHours)))
       const want = Math.max(1, Math.round(num(limit, cfg.collect.topCount)))
       const since = Date.now() - windowHours * 3_600_000
-      const sessions = typeof this.deps.knownSessions === 'function' ? this.deps.knownSessions() : []
+      // knownSessions 现在是 async（要查 sessionPersistence.list）
+      const rawSessions = typeof this.deps.knownSessions === 'function'
+        ? await this.deps.knownSessions()
+        : []
+      const sessions = Array.isArray(rawSessions) ? rawSessions : []
       const readMessages = this.deps.readMessages
       if (typeof readMessages !== 'function') return { ok: false, reason: '宿主没有提供读取会话消息的通道' }
+      out.diag.sessions = Array.isArray(sessions) ? sessions.length : 0
+      if (out.diag.sessions === 0) {
+        out.stopReason = '没有任何已知会话（插件还没见过 QQ 消息？）'
+        return out
+      }
 
       // ① 取窗内消息；② 每次出现都计数
       const counts = new Map() // refKey -> { ref, count, lastAt, hint }
@@ -180,13 +194,27 @@ export class Collector {
           this.log('debug', `读会话 ${sessionId} 失败：${error?.message ?? error}`)
           continue
         }
+        out.diag.messages += Array.isArray(messages) ? messages.length : 0
+        let sawImage = false
         for (const message of messages) {
-          if (!message || message.time < since) continue
-          if (String(message.senderId ?? '') === String(message.selfId ?? '')) continue // 跳过自己发的
-          const content = Array.isArray(message.content) ? message.content : []
-          const hint = oneLine(content.filter((b) => b?.type === 'text').map((b) => b.text).join(' '), 120)
+          if (!message || message.time < since) { out.diag.skippedByWindow++; continue }
+          // ⚠️ 只在**两边都真有值**时才判断"是不是自己发的"。
+          // 以前 selfId 恒为 ''，senderId 拿不到也是 '' → 每条消息都被误判成
+          // 自己发的，回扫永远 considered=0（2026-10-26 真机踩过的致命 bug）。
+          const sender = message.senderId === undefined || message.senderId === null ? '' : String(message.senderId)
+          const self = message.selfId === undefined || message.selfId === null ? '' : String(message.selfId)
+          if (sender !== '' && self !== '' && sender === self) { out.diag.skippedSelf++; continue }
+          const rawContent = Array.isArray(message.content) ? message.content : []
+          const hint = oneLine(rawContent.filter((b) => b?.type === 'text').map((b) => b.text).join(' '), 120)
+          // 桥接在 prompt 文本里留了 [[qqimg:<token>]]：这里同样要把 token 挂到
+          // 对应的 image 块上，否则 collect 只能拿到 DSH 归一化后的单帧（GIF 丢帧）。
+          // ⚠️ attachRawTokens 返回新数组：DSH 的 content 是冻结对象（不能原地加字段）。
+          // 与 index.js 的实时收图共用 src/rawtoken.js，确保两条路行为一致。
+          const content = attachRawTokens(rawContent, this.deps.rawImages).content
           for (const block of content) {
             if (!block || block.type !== 'image' || !block.attachment) continue
+            out.diag.imageBlocks++
+            sawImage = true
             const key = String(block.attachment.attachmentId ?? '')
             if (!key) continue
             const prev = counts.get(key)
@@ -198,6 +226,7 @@ export class Collector {
             }
           }
         }
+        if (sawImage) out.diag.sessionsWithImages++
       }
       out.considered = counts.size
 
@@ -219,9 +248,11 @@ export class Collector {
             sessionId: '',
             srcHint: entry.hint,
             source: 'observed',
-            width: entry.ref.width,
-            height: entry.ref.height,
-            mediaType: entry.ref.mediaType,
+            // 原始池命中时不能用 ref 上报的宽高：那是 DSH 归一化后的尺寸，
+            // 对 GIF 完全对不上。让 library 从真实字节里读。
+            width: stored.fromRaw ? undefined : entry.ref.width,
+            height: stored.fromRaw ? undefined : entry.ref.height,
+            mediaType: stored.fromRaw ? stored.mediaType : entry.ref.mediaType,
           })
           if (!result.ok) { out.failed++; return }
           if (result.duplicate) { out.already++; return }

@@ -113,12 +113,84 @@ await check('只给 {provider, model} 却带 controls 派发 → 比对失败（
   )
 })
 
-await check('index.js 里两处调用都走 buildCallConfig（没有漏网的裸 prepareCall）', () => {
-  // 允许出现 llm.prepareCall(callConfig)，但不允许 prepareCall({ provider: ... })
-  const bare = [...SOURCE.matchAll(/prepareCall\(\s*\{\s*provider:/g)]
-  assert.equal(bare.length, 0, `发现裸写的 prepareCall({ provider: ... })：${bare.length} 处，应改用 buildCallConfig`)
-  const good = [...SOURCE.matchAll(/prepareCall\(callConfig\)/g)]
-  assert.ok(good.length >= 2, `应有 ≥2 处 prepareCall(callConfig)，实际 ${good.length}`)
+console.log('\n③ 第二层真凶：reasoningEffort 被 DSH 自动补全')
+
+/**
+ * 复刻 dsh-llm 的 `resolveCallWithInfo`（L2183-2207）。
+ * 这是真机上「修了 temperature/maxTokens 还在报错」的原因：
+ * 模型带 `reasoning.defaultEffort` 时，DSH 会把 resolvedConfig.reasoningEffort
+ * 补成那个值，而调用方的 options 里还是 undefined → 比对失败。
+ */
+function resolveCallWithInfo(config, info) {
+  const defaulted = config.maxTokens === void 0 && info.defaultMaxTokens !== undefined
+    ? { ...config, maxTokens: info.defaultMaxTokens } : config
+  const reasoning = info.reasoning
+  const requested = defaulted.reasoningEffort
+  let resolvedConfig = defaulted
+  if (reasoning === undefined) {
+    if (requested !== undefined) throw new Error('UNSUPPORTED_REASONING_EFFORT')
+  } else {
+    const effective = requested ?? reasoning.defaultEffort
+    if (effective !== undefined) {
+      if (requested !== effective) resolvedConfig = { ...defaulted, reasoningEffort: effective }
+    }
+  }
+  return resolvedConfig
+}
+
+// 真机 trae 模型的 reasoning 元数据（有 defaultEffort='high'）
+const MODEL_INFO = {
+  defaultMaxTokens: 8192,
+  reasoning: { efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'high' },
+}
+
+await check('不带 reasoningEffort 时 resolved 会被补成 defaultEffort（坑真实存在）', () => {
+  const config = buildCallConfig({ provider: 'trae', model: 'deepseek-v4.1-flash' }, { maxTokens: 2600, temperature: 0.2 })
+  const resolved = resolveCallWithInfo(config, MODEL_INFO)
+  assert.equal(resolved.reasoningEffort, 'high', 'DSH 应把 reasoningEffort 补成 defaultEffort')
+  assert.equal(
+    callConfigEquals({ ...config, messages: [] }, resolved), false,
+    '原始 config 与 resolved 必然不相等 —— 这正是真机第二次报错的原因',
+  )
+})
+
+await check('用 prepared.config 回填后比对通过（callViaPrepared 的做法）', () => {
+  const config = buildCallConfig({ provider: 'trae', model: 'deepseek-v4.1-flash' }, { maxTokens: 2600, temperature: 0.2 })
+  const resolved = resolveCallWithInfo(config, MODEL_INFO)
+  const aligned = {
+    ...config,
+    ...resolved,
+    provider: resolved.provider,
+    model: resolved.model,
+    ...('reasoningEffort' in resolved ? { reasoningEffort: resolved.reasoningEffort } : {}),
+    ...('temperature' in resolved ? { temperature: resolved.temperature } : {}),
+    ...('maxTokens' in resolved ? { maxTokens: resolved.maxTokens } : {}),
+    messages: [],
+  }
+  assert.equal(
+    callConfigEquals(aligned, resolved), true,
+    `回填后应相等：aligned=${JSON.stringify({ ...aligned, messages: '[...]' })} resolved=${JSON.stringify(resolved)}`,
+  )
+})
+
+await check('模型没有 reasoning 元数据时也不会误加字段', () => {
+  const config = buildCallConfig({ provider: 'p', model: 'm' }, { maxTokens: 100 })
+  const resolved = resolveCallWithInfo(config, {})
+  assert.equal(Object.hasOwn(resolved, 'reasoningEffort'), false)
+  assert.equal(callConfigEquals({ ...config, messages: [] }, resolved), true)
+})
+
+await check('两处调用都走 callViaPrepared（没有漏网的裸 prepared.stream）', () => {
+  // 只统计真正的代码行（排除注释）：以 `return prepared.stream(` 或裸 `prepared.stream(` 开头的
+  const codeLines = SOURCE.split('\n').filter((line) => {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('*') || trimmed.startsWith('//')) return false
+    return /prepared\.stream\(/.test(trimmed)
+  })
+  // callViaPrepared 内部那一处是允许的（它就是唯一入口）
+  assert.equal(codeLines.length, 1, `prepared.stream 应只在 callViaPrepared 里出现 1 次，实际 ${codeLines.length} 处：${JSON.stringify(codeLines)}`)
+  const good = [...SOURCE.matchAll(/callViaPrepared\(/g)]
+  assert.ok(good.length >= 2, `应有 ≥2 处 callViaPrepared（视觉 + 纯文本），实际 ${good.length}`)
 })
 
 console.log(`\n${'='.repeat(60)}`)

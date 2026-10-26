@@ -160,7 +160,20 @@ export class Ingestor {
       }
       if (this.hourlyLeft() <= 0) { skipped.push('hour-limit'); continue }
       const dims = effectiveDimensions(ref)
-      if (cfg.collect.stickerOnly && !isLikelySticker(
+      /**
+       * 判定「像不像表情」。
+       *
+       * ⚠️ 容易误杀的坑（2026-10-26 真机）：
+       *   ref 上的 mediaType / 尺寸 / 字节都是 **DSH 归一化后**的 —— 一张 GIF 会被
+       *   转成单帧 webp，mediaType 不再是 image/gif，isLikelySticker 的 GIF 快速
+       *   通道就失效了，再按普通图判尺寸/字节，很容易被误判成"不是表情"。
+       *
+       *   所以：**只要池里有这张图的原始字节、且原始类型是 GIF，就直接放行**，
+       *   完全不看 ref 上那些归一化后的数字。
+       */
+      const rawType = this._rawMediaTypeOf(ref)
+      const looksGif = String(rawType ?? ref.mediaType ?? '') === 'image/gif'
+      if (cfg.collect.stickerOnly && !looksGif && !isLikelySticker(
         { mediaType: ref.mediaType, bytes: ref.bytes, width: dims.width, height: dims.height },
         cfg,
       )) {
@@ -191,6 +204,19 @@ export class Ingestor {
       }
     } finally {
       this._draining = false
+    }
+  }
+
+  /** 池里这张图的原始媒体类型（没挂 token / 池里没有就返回 undefined）。 */
+  _rawMediaTypeOf(ref) {
+    try {
+      const token = ref?.rawToken
+      if (!token) return undefined
+      const store = this.deps.rawImages
+      if (!store || typeof store.peek !== 'function') return undefined
+      return store.peek(String(token))?.mediaType
+    } catch {
+      return undefined
     }
   }
 

@@ -121,6 +121,31 @@ export function registerRoutes(ctx, runtime) {
         const stats = runtime.rawImages?.stats?.()
         return { count: num(stats?.count, 0), bytes: num(stats?.bytes, 0) }
       }) ?? { count: 0, bytes: 0 },
+      // 收图链路诊断：事件到没到、图片块有没有、入队多少、被什么条件挡下。
+      // 排「群友发了图但库里没有」时先看这个，比自己猜快得多。
+      ingestDiag: safeBrief(() => {
+        const diag = runtime.guards?.ingestDiag
+        if (!diag) {
+          return {
+            events: 0, userMessages: 0, withImage: 0, queuedTotal: 0,
+            skipped: {}, lastSkip: '尚未收到任何事件', lastEventAt: 0, lastImageAt: 0,
+          }
+        }
+        return {
+          events: num(diag.events, 0),
+          userMessages: num(diag.userMessages, 0),
+          withImage: num(diag.withImage, 0),
+          queuedTotal: num(diag.queuedTotal, 0),
+          lastRawTokens: num(diag.lastRawTokens, 0),
+          skipped: { ...(diag.skipped ?? {}) },
+          lastSkip: String(diag.lastSkip ?? ''),
+          lastEventAt: num(diag.lastEventAt, 0),
+          lastImageAt: num(diag.lastImageAt, 0),
+        }
+      }) ?? { events: 0, userMessages: 0, withImage: 0, queuedTotal: 0, skipped: {} },
+      // 打标链路的**真实**状态：静态检查 + 上一次真实调用的结果。
+      // UI 的「视觉识别通道」据此显示「就绪 / 上次失败：原因」，不再虚假乐观。
+      visionDiag: safeBrief(() => visionDiagnostics(runtime)) ?? { ok: false, reason: '诊断不可用', canSee: false },
       jobs: runtime.jobs?.list?.() ?? [],
     })
   }, 'qq-sticker: state route')
@@ -510,6 +535,50 @@ function visionBrief(runtime) {
     brief = { ok: false, reason: errorText(error) }
   }
   return { ok: brief?.ok === true, reason: String(brief?.reason ?? '') }
+}
+
+/**
+ * 打标链路的**真实**诊断。
+ *
+ * 为什么需要：`vision.available()` 只做静态检查（handler 在不在、路由解析得到不），
+ * 它说"就绪"并不代表真能打标 —— 之前 UI 显示"视觉识别通道就绪"但一点就报
+ * `prepared LLM call config changed`，属于**虚假的乐观**。这里把上一次真实调用的
+ * 结果也带上，UI 据此显示"就绪 / 上次失败：原因"。
+ *
+ * @param {object} runtime
+ * @returns {{ok:boolean, reason:string, route?:string, canSee:boolean, lastCall?:object}}
+ */
+function visionDiagnostics(runtime) {
+  const brief = visionBrief(runtime)
+  let route = ''
+  let canSee = false
+  try {
+    const cfg = runtime.getConfig()
+    const resolved = resolveChatRouteSafe(runtime, cfg)
+    if (resolved) {
+      route = `${resolved.provider}/${resolved.model}`
+      canSee = true
+    }
+  } catch { /* 路由解析失败不影响诊断结构 */ }
+  const lastCall = runtime.guards?.lastVisionCall ?? undefined
+  return {
+    ok: brief.ok && canSee,
+    reason: brief.reason,
+    route,
+    canSee,
+    ...(lastCall ? { lastCall } : {}),
+  }
+}
+
+/** 保守地解析看图路由（拿不到就返回 undefined，绝不抛）。 */
+function resolveChatRouteSafe(runtime, cfg) {
+  try {
+    const resolver = runtime.resolveChatRoute
+    if (typeof resolver === 'function') return resolver()
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**

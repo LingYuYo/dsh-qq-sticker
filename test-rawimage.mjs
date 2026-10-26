@@ -267,6 +267,71 @@ await check('从池里取 GIF 字节入库 → item.animated=true 且落盘仍�
   assert.equal(result.item.ext, 'gif')
 })
 
+console.log('\n⑤ 实时收图与回扫共用同一套 token 对齐（防行为不一致）')
+
+await check('冻结的 content 也能挂 token（DSH 的 deriveMessages 返回冻结对象）', async () => {
+  const { attachRawTokens } = await import('./src/rawtoken.js')
+  // 先往池里放一张
+  await runtime.rawImages.put({
+    token: 'frozen001abcdef',
+    mediaType: 'image/gif',
+    dataB64: makeGif().toString('base64'),
+  })
+  // 复刻 DSH 的形状：content 数组与每个 block、attachment 全部 Object.freeze
+  const attachment = Object.freeze({
+    attachmentId: 'sha256:' + 'c'.repeat(64),
+    mediaType: 'image/webp', width: 240, height: 240, bytes: 7106,
+  })
+  const content = Object.freeze([
+    Object.freeze({ type: 'text', text: '看图\n\n[[qqimg:frozen001abcdef]]' }),
+    Object.freeze({ type: 'image', attachment }),
+  ])
+  // 关键：不能抛 "Cannot add property rawToken, object is not extensible"
+  const result = attachRawTokens(content, runtime.rawImages)
+  assert.equal(result.attached, 1, '应该挂上 1 张')
+  assert.equal(result.content[1].attachment.rawToken, 'frozen001abcdef', '挂上后应能读到 token')
+  // 原对象不能被改（我们返回的是副本）
+  assert.equal(Object.hasOwn(attachment, 'rawToken'), false, '不该污染 DSH 的原始冻结对象')
+  assert.notEqual(result.content, content, '应返回新数组而不是原引用')
+})
+
+await check('没有 token 时原样返回（不改引用、attached=0）', async () => {
+  const { attachRawTokens } = await import('./src/rawtoken.js')
+  const content = Object.freeze([Object.freeze({ type: 'text', text: '纯文字' })])
+  const result = attachRawTokens(content, runtime.rawImages)
+  assert.equal(result.attached, 0)
+  assert.equal(result.content, content, '没有可挂的 token 时应原样返回同一个引用')
+})
+
+await check('两份实现已合并为 src/rawtoken.js（只有一个来源）', async () => {
+  const { readFileSync } = await import('node:fs')
+  const repo = 'D:/DeepSeekHarness_workarea/Dsh-QQ-Mod/dsh-qq-sticker'
+  const indexSrc = readFileSync(`${repo}/index.js`, 'utf8')
+  const collectSrc = readFileSync(`${repo}/src/collect.js`, 'utf8')
+  assert.ok(/from '\.\/src\/rawtoken\.js'/.test(indexSrc), 'index.js 应从 src/rawtoken.js 导入')
+  assert.ok(/from '\.\/rawtoken\.js'/.test(collectSrc), 'collect.js 应从 src/rawtoken.js 导入')
+  // 不允许再有内联的 token 对齐副本（那种副本最容易漂）
+  assert.ok(!/if \(store\.peek\(token\)\) tokens\.push/.test(indexSrc), 'index.js 不该再有内联实现')
+  assert.ok(!/if \(store\.peek\(token\)\) tokens\.push/.test(collectSrc), 'collect.js 不该再有内联实现')
+})
+
+await check('回扫的 knownSessions 在 tracker 为空时会退到 sessions.list()', async () => {
+  const { readFileSync } = await import('node:fs')
+  const indexSrc = readFileSync('D:/DeepSeekHarness_workarea/Dsh-QQ-Mod/dsh-qq-sticker/index.js', 'utf8')
+  assert.ok(/function listKnownSessions/.test(indexSrc), '应有 listKnownSessions（重启后 tracker 为空的兜底）')
+  assert.ok(/sessions\.list\(\)/.test(indexSrc), '应调用 sessions.list() 兜底')
+  assert.ok(!/knownSessions: \(\) => runtime\.tracker\.sessions\(\)/.test(indexSrc),
+    'collector 不该直接用 tracker.sessions（重启后为空 → 收集失效）')
+})
+
+await check('/state 暴露 ingestDiag 与 visionDiag（排障与诚实状态）', async () => {
+  const st = await hit(webServer, '/dsh-qq-sticker/state', { method: 'GET' })
+  assert.ok('ingestDiag' in (st.json ?? {}), '/state 应含 ingestDiag')
+  assert.ok('visionDiag' in (st.json ?? {}), '/state 应含 visionDiag')
+  assert.equal(typeof st.json.ingestDiag.events, 'number')
+  assert.equal(typeof st.json.visionDiag.ok, 'boolean')
+})
+
 /* ── 收尾 ────────────────────────────────────────────────── */
 if (savedHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = savedHome

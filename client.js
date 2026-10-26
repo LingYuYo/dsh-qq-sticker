@@ -2251,8 +2251,101 @@ window.__ModuleLoader__.load({
 
     // ───────────────────────────────────────────── 概览
 
-    function StatusTab({ data, onGoto, onOpenError }) {
-      if (!data) return h(Empty, { title: '还没有数据', desc: '等第一次状态轮询完成；如果一直停在加载中，看顶部错误提示。' })
+    /**
+     * 「视觉识别通道」状态行。
+     *
+     * 关键原则：**只报真实情况**。
+     *  - 静态检查失败 → 直接说原因（模型不支持图片 / 没有 handler）；
+     *  - 静态检查过、但上一次真实调用失败过 → 显示失败原因，而不是「就绪」；
+     *  - 都没问题且从没失败过 → 才显示「就绪」。
+     * 之前的版本只要 handler 存在就显示就绪，真机上一打标就报错，属于虚假状态。
+     */
+    function visionRow(vision, diag) {
+      const last = diag?.lastCall
+      const lastFailed = last && last.ok === false
+      const route = diag?.route || ''
+      let tone = 'qqs-dot-ok'
+      let label = '就绪'
+      let desc
+      if (vision?.ok !== true) {
+        tone = 'qqs-dot-warn'
+        label = '受限'
+        desc = vision?.reason || '当前没有可用的看图路由'
+      } else if (lastFailed) {
+        tone = 'qqs-dot-err'
+        label = '上次失败'
+        desc = `上次打标失败：${last.reason || '未知原因'}${route ? `（${route}）` : ''}`
+      } else if (!diag?.canSee) {
+        tone = 'qqs-dot-warn'
+        label = '无路由'
+        desc = '找不到能看图的模型路由：设置里指定 provider/model，或确认会话有默认模型'
+      } else {
+        desc = `可以看图打标${route ? `（${route}）` : ''}${last?.at ? ` · 上次成功 ${fmtTime(last.at)}` : ''}`
+      }
+      return h(Row, { label: '视觉识别通道', desc }, h('span', { className: 'qqs-inline' },
+        h('span', { className: `qqs-dot ${tone}` }),
+        h('span', { className: 'qqs-muted' }, label)))
+    }
+
+    /**
+     * 「收图链路」状态行：把 ingestDiag 翻译成人话。
+     *
+     * 排「群友发了图但库里没有」的关键信息：事件有没有到、图片块有没有、
+     * 入队多少、被哪个条件挡下（not-sticker / hour-limit / collect-disabled...）。
+     */
+    function ingestRow(ingest, diag) {
+      const events = Number(diag?.events) || 0
+      const withImage = Number(diag?.withImage) || 0
+      const queued = Number(diag?.queuedTotal) || 0
+      const skipped = diag?.skipped ?? {}
+      const reasons = Object.entries(skipped)
+        .filter(([, count]) => Number(count) > 0)
+        .map(([reason, count]) => `${ingestSkipLabel(reason)}×${count}`)
+      let tone = 'qqs-dot-ok'
+      let label = '正常'
+      const parts = []
+      parts.push(ingest?.queued > 0 ? `${ingest.queued} 张待处理` : '无积压')
+      if (events === 0) {
+        tone = 'qqs-dot-warn'
+        label = '没收到事件'
+        parts.push('插件重启后还没收到任何会话事件 —— 发条消息试试')
+      } else if (withImage === 0) {
+        tone = 'qqs-dot-warn'
+        label = '没有带图消息'
+        parts.push(`已收到 ${events} 个事件，但都没有图片块（桥接可能没把图转给 DSH）`)
+      } else {
+        parts.push(`收到 ${withImage} 条带图消息 · 入队 ${queued}`)
+        if (reasons.length) {
+          tone = 'qqs-dot-warn'
+          label = '有图被跳过'
+          parts.push(`跳过：${reasons.join(' ')}`)
+        }
+      }
+      if (diag?.lastSkip && withImage > 0 && !reasons.length) parts.push(`最近一次：${ingestSkipLabel(diag.lastSkip)}`)
+      return h(Row, { label: '收图链路', desc: parts.join(' · ') }, h('span', { className: 'qqs-inline' },
+        h('span', { className: `qqs-dot ${tone}` }),
+        h('span', { className: 'qqs-muted' }, label)))
+    }
+
+    /** 收图跳过原因 → 人话。 */
+    function ingestSkipLabel(reason) {
+      const text = String(reason ?? '')
+      const map = {
+        disabled: '插件或收集已关闭',
+        'no-image': '这条消息没图',
+        'no-ref': '图没有附件 id',
+        replay: '重复消息',
+        'hour-limit': '触到每小时上限',
+        'not-sticker': '判定不像表情',
+        'collect-disabled': '收集开关关着',
+        'plugin-disabled': '插件总开关关着',
+        'no-message': '消息体为空',
+        'no-session-id': '拿不到会话 id',
+      }
+      return map[text] ?? text
+    }
+
+    function StatusTab({ data, onGoto, onOpenError }) {      if (!data) return h(Empty, { title: '还没有数据', desc: '等第一次状态轮询完成；如果一直停在加载中，看顶部错误提示。' })
 
       const library = data.library ?? {}
       const limits = data.limits ?? {}
@@ -2334,16 +2427,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'qqs-card' },
           h('div', { className: 'qqs-card-title' }, '运行状态'),
           h('div', { className: 'qqs-rows' },
-            h(Row, { label: '视觉识别通道', desc: vision.ok ? '可以看图打标' : (vision.reason || '不可用') },
-              h('span', { className: 'qqs-inline' },
-                h('span', { className: `qqs-dot ${vision.ok ? 'qqs-dot-ok' : 'qqs-dot-warn'}` }),
-                h('span', { className: 'qqs-muted' }, vision.ok ? '就绪' : '受限'))),
-            h(Row, {
-              label: '收图队列',
-              desc: ingest.draining ? '正在把图写进库' : '空闲',
-            }, h('span', { className: 'qqs-inline' },
-              h('span', { className: `qqs-dot ${ingest.queued > 0 ? 'qqs-dot-warn qqs-dot-live' : 'qqs-dot-ok'}` }),
-              h('span', { className: 'qqs-muted' }, ingest.queued > 0 ? `${ingest.queued} 张待处理` : '无积压'))),
+            // ⚠️ 诚实显示：静态检查通过 ≠ 真能打标。上一次真实调用失败过就照实说，
+            //    不要因为 handler 存在就显示"就绪"（那会在真机上给虚假希望）。
+            visionRow(vision, data?.visionDiag),
+            ingestRow(ingest, data?.ingestDiag),
             h(Row, {
               label: '上次自动收集',
               // ⚠️ lastResult 的实际形状是对象（collect.js 的 summarizeResult）：

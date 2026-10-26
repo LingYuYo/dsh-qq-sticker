@@ -69,7 +69,7 @@ dsh-qq-sticker/
   test-zip-backup.mjs     # 36 条：ZIP 往返 + 系统解压器双重验证 + 备份保留策略
   test-config-writable.mjs # 8 条：Config 可写性（13 段 / 65 叶子 volatile + live Schema 比对）
   test-gif.mjs            # 15 条：GIF 收集放宽 / 原始图池 / 发送位置与 sub_type
-  test-rawimage.mjs       # 8 条：桥接↔插件原始图转交协议（/raw-image + [[qqimg:]] 对齐）
+  test-rawimage.mjs       # 13 条：桥接↔插件原始图转交协议（/raw-image + 冻结对象 + [[qqimg:]] 对齐）
   test-llm-call.mjs       # 7 条：prepareCall 与 stream 配置一致（打标报错的回归守卫）
   docs/
     settings-save-troubleshooting.md  # 「保存失败 / 需重启」的根因与排查（含实测证据）
@@ -296,7 +296,7 @@ node test-proactive.mjs            # 46 条：主动发图闸门 / 连发 / 斗�
 node test-zip-backup.mjs           # 36 条：ZIP 往返 + 系统解压验证 + 备份保留
 node test-config-writable.mjs      # 8 条：Config 可写性（源码 13 段/65 叶子 volatile + live Schema 比对）
 node test-gif.mjs                  # 15 条：GIF 收集放宽 / 原始图池 / 发送位置 / sub_type
-node test-rawimage.mjs             # 8 条：原始图转交协议（/raw-image + [[qqimg:]] 对齐）
+node test-rawimage.mjs             # 13 条：原始图转交协议（/raw-image + 冻结对象 + [[qqimg:]] 对齐）
 node test-llm-call.mjs             # 7 条：prepareCall/stream 配置一致（防「config changed」回归）
 ```
 
@@ -361,6 +361,65 @@ Config field "proactive.enabled" is not volatile
 1. 设置页顶部有没有黄条？有 → 直接重启 DSH，不用看别的。
 2. 没有黄条但仍保存失败 → 点 F12 看 Console 里 `[qq-sticker] mutate 未成功` 后面带的具体 code / message。
    `SETTINGS_CONFLICT`（revision 过期）重试一次即可；其它按 message 判断。
+
+---
+
+## 2026-10-26 真机排查记录：三个「看起来修好了但没修好」的坑
+
+这一轮上线后真机仍然失败，挖出几个隐藏很深的 bug。记在这里，免得以后重犯。
+
+### 坑一：`prepared LLM call config changed` 有两层
+
+上轮只修了「temperature/maxTokens 只进 stream 不进 prepareCall」。真机还报错，因为
+**DSH 会自动补 `reasoningEffort`**：
+
+```js
+// dsh-llm/lib/index.js resolveCallWithInfo
+const effective = requested ?? reasoning.defaultEffort
+if (requested !== effective) resolvedConfig = { ...defaulted, reasoningEffort: effective }
+```
+
+模型带 `defaultEffort`（trae 是 `'high'`）而我们不传 reasoningEffort 时，
+`resolved.config` 会多出 `reasoningEffort: 'high'`，派发前逐字段比对必然不等。
+
+**正确修法**：不要试图在外面复现 DSH 的默认值补全规则，
+用 `prepared.config` 回填 stream 的 options（见 `callViaPrepared`）。
+
+### 坑二：收集的 `skippedSelf` 把全部消息误杀了
+
+`readSessionMessages` 里 `selfId` 硬编码为 `''`，而 `senderId` 拿不到也是 `''`：
+
+```js
+if (String(message.senderId ?? '') === String(message.selfId ?? '')) continue  // 每条都命中!
+```
+
+真机实测 108 条消息全被当成「自己发的」跳过，`imageBlocks: 0`。
+修法：拿不到就返回 `undefined`，且只在**两边都真有值**时才比较。
+
+### 坑三：DSH 的 content 是冻结对象，不能原地加字段
+
+`session.deriveMessages()` 返回的 content/attachment 都是 `Object.freeze` 过的。
+`attachment.rawToken = token` 直接抛 `Cannot add property rawToken, object is not extensible`，
+整条收集失败。修法：`attachRawTokens` 改为**复制**出新数组（见 `src/rawtoken.js`）。
+
+### 坑四：回扫拿不到会话
+
+`tracker.sessions()` 是进程内内存记录（重启后为空），`sessions.list()` 只返回**活会话**
+（QQ 会话重启后没有活跃 agent，不在里面）。真机实测 146 个会话里 QQChat 的 14 个
+`agentAvailable` 全是 false。
+
+**正确来源**：`sessionPersistence.list()` —— 它列所有**已存储**的会话（含历史）。
+
+### 排查工具
+
+插件现在通过 `/state` 暴露两个诊断字段，遇到「发了图但库里没有」先看它们：
+
+| 字段 | 看什么 |
+|---|---|
+| `ingestDiag` | 事件数 / 带图消息数 / 入队数 / `lastRawTokens` / 按原因分类的跳过计数 |
+| `visionDiag` | 静态可用性 + **上一次真实调用**的 ok/reason/route |
+
+`visionDiag.lastCall.ok === false` 时，UI 会显示「上次失败：具体原因」而不是「就绪」。
 
 ---
 

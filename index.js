@@ -35,6 +35,9 @@ import { buildTools, TOOL_NAMES, toolsBrief } from './src/tools.js'
 import { emptyState } from './src/gate.js'
 import { registerRoutes } from './src/server.js'
 import { RawImageStore } from './src/rawstore.js'
+import {
+  attachRawTokens, pickRawToken as pickRawTokenFromRef, stripTokens, tokensInText,
+} from './src/rawtoken.js'
 
 export const name = 'dsh-qq-sticker'
 
@@ -164,6 +167,16 @@ export function createRuntime(ctx, config) {
   const getAttachments = () => safeService(ctx, 'attachments') ?? null
   runtime.attachments = getAttachments()
 
+  /** 给 /state 的诊断用：解析当前看图路由（拿到就说明 LV 通道有可用路由）。 */
+  runtime.resolveChatRoute = () => {
+    try {
+      const cfg = getConfig()
+      return resolveChatRoute(ctx, cfg, cfg.vision.providerId, cfg.vision.model)
+    } catch {
+      return undefined
+    }
+  }
+
   /**
    * 读图字节。三种来源，按优先级：
    *  ① **原始图池**（桥接转交的未转码字节）—— 只有这条路能拿到动图帧；
@@ -234,6 +247,15 @@ export function createRuntime(ctx, config) {
       canSee: () => visionCanSee(ctx, getConfig()),
       budgetLeft: () => runtime.ingestor.budgetLeft(),
       useBudget: () => runtime.ingestor.useVisionBudget(),
+      // 上一次真实视觉调用的结果（成功/失败 + 原因），给 UI 做诚实的状态显示。
+      onCallResult: (result) => {
+        runtime.guards.lastVisionCall = {
+          ok: result?.ok === true,
+          reason: String(result?.reason ?? ''),
+          at: Date.now(),
+          route: String(result?.route ?? ''),
+        }
+      },
     },
   })
 
@@ -245,6 +267,8 @@ export function createRuntime(ctx, config) {
     markStateDirty: () => realSaver.mark(),
     deps: {
       readImage: (ref) => runtime.readImageBytes(ref),
+      // 判定「像不像表情」时要查原始类型（GIF 被 DSH 归一化成 webp 后不能看 ref.mediaType）
+      rawImages: runtime.rawImages,
       onIngested: async (item) => {
         const cfg = getConfig()
         if (!cfg.vision.recognizeOnIngest) return
@@ -263,9 +287,11 @@ export function createRuntime(ctx, config) {
     log,
     dataDir,
     deps: {
-      knownSessions: () => runtime.tracker.sessions(),
+      knownSessions: () => listKnownSessions(ctx, runtime),
       readMessages: (sessionId, opts) => readSessionMessages(ctx, sessionId, opts),
       readImage: (ref) => runtime.readImageBytes(ref),
+      // 回扫也要能取原始字节（GIF 保真）；与实时收图用同一个池。
+      rawImages: runtime.rawImages,
     },
   })
 
@@ -444,6 +470,14 @@ export function startLifecycle(ctx, runtime) {
 
   // ⑤ session/event：攒窗口 + 实时收图
   ctx.on('session/event', (session, event) => {
+    // ── 诊断计数（排障用：/state.ingestDiag 能看到事件到没到、断在哪一步）──
+    // 每条事件都记，即使后面某个 return 提前退出，也能看出"收到了但没处理"。
+    const diag = runtime.guards.ingestDiag
+      ?? { events: 0, userMessages: 0, withImage: 0, queuedTotal: 0, skipped: {}, lastEventAt: 0, lastImageAt: 0, lastSkip: '' }
+    runtime.guards.ingestDiag = diag
+    diag.events++
+    diag.lastEventAt = Date.now()
+    if (event?.type === 'user/message') diag.userMessages++
     try {
       if (!event || typeof event !== 'object') return
       const sessionId = String(session?.id ?? '')
@@ -479,24 +513,36 @@ export function startLifecycle(ctx, runtime) {
       if (event.type !== 'user/message') return
       const data = event.data
       const message = data?.message ?? data
-      if (!message) return
-      if (!sessionId) return
+      if (!message) { diag.lastSkip = 'no-message'; return }
+      if (!sessionId) { diag.lastSkip = 'no-session-id'; return }
       const cfg = runtime.getConfig()
-      if (!cfg.enabled) return
+      if (!cfg.enabled) { diag.lastSkip = 'plugin-disabled'; return }
       runtime.library.config = cfg
 
       runtime.tracker.noteUserMessage(sessionId, message)
 
-      if (!cfg.collect.enabled) return
       const content = Array.isArray(message.content) ? message.content : []
+      const imageCount = content.filter((block) => block?.type === 'image' && block.attachment).length
+      if (imageCount > 0) {
+        diag.withImage++
+        diag.lastImageAt = Date.now()
+      }
+      if (!cfg.collect.enabled) { diag.lastSkip = 'collect-disabled'; return }
       // 桥接在 prompt 文本里留了 `[[qqimg:<token>]]`（每张图一行，按顺序），
       // 这里把 token 挂到对应的 image 块上：ingest 拿到它就能取原始字节（GIF 保真）。
-      attachRawTokens(content, runtime.rawImages)
+      // ⚠️ attachRawTokens 返回**新数组**：DSH 的 content 是冻结对象，不能原地加字段。
+      const { content: contentWithTokens, attached: attachedTokens } = attachRawTokens(content, runtime.rawImages)
+      if (imageCount > 0) diag.lastRawTokens = attachedTokens
       const result = runtime.ingestor.onUserMessage({
         sessionId,
-        content,
+        content: contentWithTokens,
         srcHint: textOfContent(content),
       })
+      diag.queuedTotal += result?.queued ?? 0
+      if (result?.skipped?.length) {
+        for (const reason of result.skipped) diag.skipped[reason] = (diag.skipped[reason] ?? 0) + 1
+        diag.lastSkip = result.skipped.join(',')
+      }
       if (result.queued > 0) log('debug', `会话 ${sessionId} 入队 ${result.queued} 张待收`)
     } catch (error) {
       log('warn', `session/event 处理失败（已忽略）：${error?.message ?? error}`)
@@ -712,16 +758,12 @@ async function chatText(ctx, { prompt, modelHint, maxTokens, temperature }, runt
     maxTokens: num(maxTokens, 200),
     temperature: num(temperature, 0.3),
   })
-  const prepared = typeof llm.prepareCall === 'function'
-    ? await llm.prepareCall(callConfig)
-    : null
-
-  const options = {
-    ...callConfig,
-    messages: [{ role: 'user', content: [{ type: 'text', text: String(prompt ?? '') }] }],
-  }
-
-  const stream = prepared ? prepared.stream(options) : llm.stream(options)
+  const promptContent = [{ type: 'text', text: String(prompt ?? '') }]
+  // 同 chatWithImages：用 prepared.config 回填，避免 reasoningEffort 自动补全导致的比对失败。
+  const stream = await callViaPrepared(llm, callConfig, (finalConfig) => ({
+    ...finalConfig,
+    messages: [{ role: 'user', content: promptContent }],
+  }))
   let text = ''
   let failure = ''
   for await (const chunk of stream) {
@@ -838,52 +880,13 @@ function pathToFileURLSafe(filePath) {
  * @returns {string|undefined}
  */
 function pickRawToken(ref) {
-  const direct = String(ref?.rawToken ?? '').trim()
-  if (direct) return direct
-  // 兜底：某些实现把 token 直接塞进 attachmentId（不走标准 ref 时）
-  const id = String(ref?.attachmentId ?? '')
-  return id.startsWith('raw:') ? id.slice(4) : undefined
-}
-
-/**
- * 把文本里的 `[[qqimg:<token>]]` 标记按顺序挂到消息的 image 块上（原地改）。
- *
- * 为什么这么设计：桥接没法直接往 attachment ref 上加字段（ref 是 DSH 的公开类型，
- * 多塞字段会被 admission 校验拒）。所以它把 token 写进 prompt 文本，插件这边
- * 用「文本里出现顺序 == 图片块出现顺序」对齐。这是唯一不改 DSH 协议的办法。
- *
- * 只在池子里真有这个 token 时才挂（避免把垃圾标记当成有效引用）。
- *
- * @param {Array<object>} content 消息 content blocks
- * @param {{peek:(token:string)=>object|null}} [store] 原始图池
- * @returns {number} 成功挂上的张数
- */
-function attachRawTokens(content, store) {
-  if (!Array.isArray(content) || !store || typeof store.peek !== 'function') return 0
-  const tokens = []
-  for (const block of content) {
-    if (block?.type !== 'text' || typeof block.text !== 'string') continue
-    for (const token of RawImageStore.tokensInText(block.text)) {
-      // 只认真实存在的（过期的、伪造的都跳过）
-      if (store.peek(token)) tokens.push(token)
-    }
-  }
-  if (tokens.length === 0) return 0
-  let index = 0
-  let attached = 0
-  for (const block of content) {
-    if (block?.type !== 'image' || !block.attachment) continue
-    if (index >= tokens.length) break
-    block.attachment.rawToken = tokens[index++]
-    attached++
-  }
-  return attached
+  return pickRawTokenFromRef(ref)
 }
 
 /**
  * 组装一次 LLM 调用的**完整配置**，供 prepareCall 与 stream 共用。
  *
- * ⚠️ 为什么必须两边一模一样（2026-10-25 真机踩过，报错原文：
+ * ⚠️ 为什么必须两边一模一样（2026-10-25/26 真机踩过两次，报错原文：
  * `prepared LLM call config changed before adapter dispatch`）：
  *
  *   DSH 的 `llm.prepareCall(config)` 会先按 config 算出 `resolved.config`，
@@ -892,16 +895,27 @@ function attachRawTokens(content, store) {
  *   reasoningEffort / temperature / maxTokens / stop）。只要有一个字段对不上就抛
  *   `INVALID_PREPARED_CALL`。
  *
- *   我们以前只把 `{provider, model}` 交给 prepareCall，却把
- *   `temperature` / `maxTokens` 只塞进 stream 的 options ——
- *   resolved 里没有这两个字段，比对必然失败，**每一张图都报这个错**。
+ *   第一次踩：只把 `{provider, model}` 交给 prepareCall，却把
+ *   `temperature` / `maxTokens` 只塞进 stream 的 options —— resolved 里没有这两个
+ *   字段，比对必然失败。→ 修成两边用同一份 config。
+ *
+ *   第二次踩（更难发现）：**`resolveCallWithInfo` 会偷偷补字段**。
+ *   dsh-llm 的这段逻辑（L2183-2207）：
+ *     `const effective = requested ?? reasoning.defaultEffort`
+ *     `if (requested !== effective) resolvedConfig = { ...defaulted, reasoningEffort: effective }`
+ *   也就是说，当模型带 `reasoning.defaultEffort`（如 trae 的 'high'）而我们**不传**
+ *   reasoningEffort 时，resolved.config 会被补上 `reasoningEffort: 'high'`，
+ *   而我们的 options 里还是 undefined → 比对失败。
+ *
+ *   所以光「两边传一样的 config」还不够：必须用 **prepared.config**（DSH 算出来的
+ *   最终值）回填 stream 的 options。见 `callViaPrepared()`。
  *
  *   这跟 qq-guard 的 `agent/request` 拦截器无关：那条瀑布只改普通聊天回合的
  *   provider/model，插件自己发起的 `prepareCall` 根本不经过它。
  *
  * @param {{provider:string, model:string}} route
  * @param {{maxTokens?:number, temperature?:number}} [controls]
- * @returns {object} 字段完全相同的一份 config（prepareCall 与 stream 都用它）
+ * @returns {object} 字段完全相同的一份 config（prepareCall 与 stream 的基座）
  */
 function buildCallConfig(route, controls = {}) {
   const config = { provider: route.provider, model: route.model }
@@ -914,6 +928,43 @@ function buildCallConfig(route, controls = {}) {
   return config
 }
 
+/**
+ * 用 prepared.config 回填 options，再派发。
+ *
+ * 这是唯一安全的方式：`prepareCall` 内部会对 config 做默认值补全与校验
+ * （补 maxTokens、补 reasoningEffort、检查 effort 是否受支持），
+ * 我们无法在外面准确复现那些规则。直接采用它算出来的 `prepared.config`
+ * 作为 options 的基座，`callConfigEquals(options, prepared.config)` 就必然相等。
+ *
+ * `prepared.config` 是 DSH 冻结过的对象，所以只读它、拼一个新对象给 stream。
+ *
+ * @param {object} llm llm 服务
+ * @param {object} config buildCallConfig 的产物
+ * @param {(finalOptions:object)=>object} buildOptions 拿到最终 config 后组装 messages 等
+ * @returns {AsyncIterable<object>}
+ */
+async function callViaPrepared(llm, config, buildOptions) {
+  if (typeof llm.prepareCall !== 'function') {
+    // 老宿主没有 prepareCall：只能直接 stream，没有比对环节，不会踩这个坑。
+    return llm.stream(buildOptions(config))
+  }
+  const prepared = await llm.prepareCall(config)
+  const finalConfig = prepared?.config ?? config
+  // 透传上一轮可能带上的其它字段（不覆盖 DSH 算出来的值）
+  const options = buildOptions({ ...config, ...finalConfig })
+  // 兜底：确保最终 options 的每个比对字段都等于 prepared.config
+  const aligned = {
+    ...options,
+    provider: finalConfig.provider,
+    model: finalConfig.model,
+    ...('reasoningEffort' in finalConfig ? { reasoningEffort: finalConfig.reasoningEffort } : {}),
+    ...('temperature' in finalConfig ? { temperature: finalConfig.temperature } : {}),
+    ...('maxTokens' in finalConfig ? { maxTokens: finalConfig.maxTokens } : {}),
+    ...('stop' in finalConfig ? { stop: finalConfig.stop } : {}),
+  }
+  return prepared.stream(aligned)
+}
+
 /** 用 LLM 通道发一次多模态请求，返回正文。 */
 async function chatWithImages(ctx, { prompt, imageRefs, providerId, model, maxTokens, temperature }, runtime, log) {
   const llm = safeService(ctx, 'llm')
@@ -921,15 +972,16 @@ async function chatWithImages(ctx, { prompt, imageRefs, providerId, model, maxTo
   const route = resolveChatRoute(ctx, runtime.getConfig(), providerId, model)
   if (!route) throw new Error('拿不到可用的模型路由（设置里指定 providerId/model，或确保会话有默认模型）')
   const callConfig = buildCallConfig(route, { maxTokens, temperature })
-  const prepared = typeof llm.prepareCall === 'function'
-    ? await llm.prepareCall(callConfig)
-    : null
   const content = [{ type: 'text', text: prompt }]
   for (const ref of imageRefs ?? []) {
     if (ref) content.push({ type: 'image', attachment: ref })
   }
-  const options = { ...callConfig, messages: [{ role: 'user', content }] }
-  const stream = prepared ? prepared.stream(options) : llm.stream(options)
+  // ⚠️ 必须用 callViaPrepared：DSH 的 prepareCall 会自动补 reasoningEffort/
+  //    maxTokens 默认值，只有拿它算出的 prepared.config 去派发，逐字段比对才相等。
+  const stream = await callViaPrepared(llm, callConfig, (finalConfig) => ({
+    ...finalConfig,
+    messages: [{ role: 'user', content }],
+  }))
   let text = ''
   let failure = ''
   for await (const chunk of stream) {
@@ -970,8 +1022,67 @@ function visionCanSee(ctx, config) {
 }
 
 /**
+ * 列出可以回扫的会话 id。
+ *
+ * ⚠️ 为什么不能只用 `tracker.sessions()` / `sessions.list()`（2026-10-26 真机踩过）：
+ *   · `tracker.sessions()` 是**进程内**内存记录，只在收到过 session/event 之后才有条目
+ *     —— 重启 DSH 之后它是空的。
+ *   · `sessions.list()` 只返回**当前活着的** Session 对象。QQ 会话重启后没有活跃
+ *     agent，就不在这个列表里（真机实测：146 个会话里 QQChat 的 14 个
+ *     `agentAvailable` 全是 false）。
+ *
+ *   两者都拿不到 → 回扫 0 个会话 → 用户看到「立即收集：没收到新图，候选不够」，
+ *   但群里明明发过很多图。这就是「收集彻底失效」的真因。
+ *
+ * 正确来源：`sessionPersistence.list()` —— 它列**所有已存储**的会话（含重启前落盘
+ * 的历史），正是回扫想要的。
+ *
+ * 优先级：tracker（热、快）→ persistence.list（全）→ sessions.list（活会话兜底）。
+ *
+ * @param {object} ctx
+ * @param {object} runtime
+ * @returns {Promise<string[]>}
+ */
+async function listKnownSessions(ctx, runtime) {
+  const fromTracker = (() => {
+    try { return runtime.tracker.sessions() ?? [] } catch { return [] }
+  })()
+  if (fromTracker.length > 0) return fromTracker
+
+  // persistence.list() 拿到的是**所有存储过的会话**，重启后立刻就有内容
+  try {
+    const persistence = safeService(ctx, 'sessionPersistence')
+    if (persistence && typeof persistence.list === 'function') {
+      const snapshots = await persistence.list()
+      const ids = (snapshots ?? [])
+        .map((snap) => String(snap?.header?.id ?? snap?.id ?? ''))
+        .filter(Boolean)
+      if (ids.length > 0) return ids
+    }
+  } catch (error) {
+    runtime.log?.('debug', `sessionPersistence.list 失败：${error?.message ?? error}`)
+  }
+
+  try {
+    const sessions = safeService(ctx, 'sessions')
+    if (sessions && typeof sessions.list === 'function') {
+      return (sessions.list() ?? [])
+        .map((session) => String(session?.id ?? session?.sessionId ?? ''))
+        .filter(Boolean)
+    }
+  } catch { /* 拿不到就返回空，调用方会报告原因 */ }
+  return fromTracker
+}
+
+/**
  * 读某个会话最近的消息（collect / scan 用）。
  * 优先活会话 `deriveMessages()`，退化到 `sessionPersistence` 冷读。
+ *
+ * ⚠️ `selfId` 以前恒为 `''`，而 `senderId` 拿不到时也是 `''` ——
+ * collect.js 的「跳过自己发的」判定 `String(senderId) === String(selfId)`
+ * 于是对**每一条消息都成立**，108 条全被跳过、imageBlocks=0、considered=0。
+ * 这就是「立即收集：没收到新图，候选不够」的真因（2026-10-26 真机实测）。
+ * 修法：拿不到真实 senderId/selfId 时留 `undefined`，让比较自然为 false。
  */
 async function readSessionMessages(ctx, sessionId, { limit = 3000, since = 0 } = {}) {
   const out = []
@@ -987,8 +1098,8 @@ async function readSessionMessages(ctx, sessionId, { limit = 3000, since = 0 } =
         out.push({
           content,
           time: num(message.time, Date.now()),
-          senderId: String(message.source?.senderId ?? message.senderId ?? ''),
-          selfId: '',
+          senderId: pickSenderId(message),
+          selfId: pickSelfId(message),
         })
       }
       if (out.length > 0) return out.filter((entry) => entry.time >= since)
@@ -1010,8 +1121,8 @@ async function readSessionMessages(ctx, sessionId, { limit = 3000, since = 0 } =
           out.push({
             content,
             time: num(event.time, 0),
-            senderId: String(message.source?.senderId ?? ''),
-            selfId: '',
+            senderId: pickSenderId(message),
+            selfId: pickSelfId(message),
           })
         }
       } finally {
@@ -1022,8 +1133,29 @@ async function readSessionMessages(ctx, sessionId, { limit = 3000, since = 0 } =
   return out.filter((entry) => entry.time >= since)
 }
 
-/** state.json 落盘器（防抖 1.5s）。 */
-function makeStateSaver(stateFile, getState, log) {
+/**
+ * 从一条消息里取发送者 id；**取不到就返回 undefined**（不要用 ''）。
+ *
+ * 为什么这点很关键：collect 的「跳过自己发的」判定是
+ * `String(senderId) === String(selfId)`。如果两边都退化成 ''，
+ * 每一条用户消息都会被当成"自己发的"跳过 —— 回扫永远收不到图（真机踩过）。
+ */
+function pickSenderId(message) {
+  const raw = message?.source?.senderId ?? message?.senderId ?? message?.source?.userId
+  if (raw === undefined || raw === null) return undefined
+  const text = String(raw).trim()
+  return text === '' ? undefined : text
+}
+
+/** 同理：拿不到 selfId 就返回 undefined，让它不参与相等比较。 */
+function pickSelfId(message) {
+  const raw = message?.source?.selfId ?? message?.selfId ?? message?.self?.id
+  if (raw === undefined || raw === null) return undefined
+  const text = String(raw).trim()
+  return text === '' ? undefined : text
+}
+
+/** state.json 落盘器（防抖 1.5s）。 */function makeStateSaver(stateFile, getState, log) {
   let timer = null
   let dirty = false
   let chain = Promise.resolve()

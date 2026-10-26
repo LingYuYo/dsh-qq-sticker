@@ -645,7 +645,7 @@ await check('运行状态行：视觉通道 / 收图队列 / 上次收集 / 开�
   const tree = await renderPanelSettled(mount)
   await settle()
   const rows = findAll(tree, (node) => classOf(node) === 'qqs-row-main').map(textOf)
-  for (const label of ['视觉识别通道', '收图队列', '上次自动收集', '插件开关']) {
+  for (const label of ['视觉识别通道', '收图链路', '上次自动收集', '插件开关']) {
     assert.ok(rows.includes(label), `缺少「${label}」，实际：${JSON.stringify(rows)}`)
   }
 })

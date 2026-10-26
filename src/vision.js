@@ -186,14 +186,25 @@ export class Vision {
     if (refs.length === 0) throw new Error('这批图都读不出来（文件缺失或格式不支持）')
 
     const prompt = buildPrompt(refs, cfg)
-    const text = await this.deps.chat({
-      prompt,
-      imageRefs: refs.map((entry) => entry.ref),
-      providerId: cfg.vision.providerId || undefined,
-      model: cfg.vision.model || undefined,
-      maxTokens: 2600,
-      temperature: 0.2,
-    })
+    const route = `${cfg.vision.providerId || '(会话默认)'}/${cfg.vision.model || ''}`
+    let text
+    try {
+      text = await this.deps.chat({
+        prompt,
+        imageRefs: refs.map((entry) => entry.ref),
+        providerId: cfg.vision.providerId || undefined,
+        model: cfg.vision.model || undefined,
+        maxTokens: 2600,
+        temperature: 0.2,
+      })
+      this.deps.onCallResult?.({ ok: true, reason: '', route })
+    } catch (error) {
+      // 把失败原因记下来：UI 的「视觉识别通道」要据此显示真实状态，
+      // 不能因为 handler 存在就报"就绪"（那会在真机上给虚假希望）。
+      this.deps.onCallResult?.({ ok: false, reason: String(error?.message ?? error), route })
+      this.log('warn', `视觉请求失败（route=${route}）：${error?.message ?? error}`)
+      throw error
+    }
     return parseJsonArray(text, refs.map((entry) => entry.id))
   }
 }
