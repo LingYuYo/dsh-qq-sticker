@@ -111,6 +111,11 @@ export function createActions({ runtime, jobs, log } = {}) {
           summary.deleted += Array.isArray(result?.deleted) ? result.deleted.length : 0
           if (result?.suspicious === true) summary.suspicious = true
           for (const line of result?.errors ?? []) if (line) summary.errors.push(String(line))
+          // ⚠️ 每批都落盘（不是等全部跑完）：
+          //    organize 一次可能跑几分钟，中途用户可能刷新面板、甚至进程被关掉。
+          //    只靠结束时的 flush，看到的就是「任务显示 60/60 完成，刷新后标签全没了」。
+          //    dryRun 不写库，也没必要 flush。
+          if (!dryRun) await lib.flush()
           progress(Math.min(total, offset + page.length), total, `已看 ${Math.min(total, offset + page.length)}/${total} 张`)
         }
 
@@ -123,7 +128,14 @@ export function createActions({ runtime, jobs, log } = {}) {
           deleted: summary.deleted,
           suspicious: summary.suspicious,
           dryRun,
-          detail: summary.errors.join('；'),
+          // 试运行时上面那些数字都是"如果写入会怎样"，实际没有改库。
+          // 明确标出来，免得用户以为打标成功了（真机踩过：试运行 60/60，刷新后
+          // 仍是「待打标 118 / 已打标 2」）。
+          persisted: dryRun !== true,
+          detail: [
+            ...(dryRun === true ? ['这是试运行：没有真的写入标签。关掉「试运行」再跑一次才会落盘。'] : []),
+            ...summary.errors,
+          ].join('；'),
         }
       },
     },
@@ -228,6 +240,10 @@ export function createActions({ runtime, jobs, log } = {}) {
           already: num(result?.already, 0),
           failed: num(result?.failed, 0),
           stopReason: String(result?.stopReason ?? ''),
+          // 失败明细（为什么这 N 张没收进来）：下载失败 / 读不到字节 / 太大 / 格式不认…
+          ...(Array.isArray(result?.failures) && result.failures.length
+            ? { failures: result.failures.slice(0, 20), failureCount: num(result?.failureCount, result.failures.length) }
+            : {}),
           // ⚠️ 把回扫诊断原样带出来。「considered=0」光看这个数字没法判断是
           //    没会话、没消息、还是消息里没图片块 —— 排障全靠这几个计数。
           ...(result?.diag ? { diag: result.diag } : {}),

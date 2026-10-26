@@ -128,23 +128,44 @@ export async function listDir(dir) {
  *
  * 库一改就整份写盘在 500~800 张规模下会很费 IO，而 session/event 一秒能来好几条；
  * 所以统一走这里：标记脏 + 延迟写，卸载时 flush。
+ *
+ * ⚠️ 两个容易丢数据的边界（2026-10-26 真机排查后加固）：
+ *  ① `mark()` 在已有定时器时直接 return —— 若这期间又发生改动，定时器还是原来那个，
+ *     到点写盘内容确实是最新的（因为写的是整份内存快照），所以这条其实安全。
+ *  ② **真正危险的是 `flush()` 之后的改动**：flush 把 dirty 清成 false 并开始写盘，
+ *     若写盘期间又有 mark()，dirty 变 true 但没人再排期 → 这份改动要等到
+ *     *下一次* mark 才可能落盘，可能永远不落。
+ *     修法：写盘期间新标记的 dirty，在写完后自动再排一次。
  */
 export function createSaver(delayMs, writer) {
   let timer = null
   let dirty = false
+  /** 是否正在写盘（写盘期间来的改动要在写完后补排一次）。 */
+  let writing = false
   let chain = Promise.resolve()
+  const schedule = () => {
+    if (timer || writing) return
+    timer = setTimeout(() => { timer = null; void flush() }, delayMs)
+    timer.unref?.()
+  }
   const flush = async () => {
     if (timer) { clearTimeout(timer); timer = null }
     if (!dirty) return
     dirty = false
-    chain = chain.then(() => writer()).catch(() => { /* 写失败不炸插件，下次再写 */ })
+    writing = true
+    chain = chain
+      .then(() => writer())
+      .catch(() => { /* 写失败不炸插件，下次再写 */ })
+      .finally(() => {
+        writing = false
+        // 写盘期间又被标脏了 → 补排一次，别把这次改动漏掉
+        if (dirty) schedule()
+      })
     await chain
   }
   const mark = () => {
     dirty = true
-    if (timer) return
-    timer = setTimeout(() => { timer = null; void flush() }, delayMs)
-    timer.unref?.()
+    schedule()
   }
   return { mark, flush, get dirty() { return dirty } }
 }

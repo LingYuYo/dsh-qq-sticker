@@ -137,6 +137,9 @@ export function registerRoutes(ctx, runtime) {
           withImage: num(diag.withImage, 0),
           queuedTotal: num(diag.queuedTotal, 0),
           lastRawTokens: num(diag.lastRawTokens, 0),
+          // DSH 自己注入的运行时上下文被跳过的条数（不是群友的消息，
+          // 不该混进「跳过：这条消息没图」的统计里误导排障）
+          skippedContext: num(diag.skippedContext, 0),
           skipped: { ...(diag.skipped ?? {}) },
           lastSkip: String(diag.lastSkip ?? ''),
           lastEventAt: num(diag.lastEventAt, 0),

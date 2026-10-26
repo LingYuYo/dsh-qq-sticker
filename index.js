@@ -519,10 +519,31 @@ export function startLifecycle(ctx, runtime) {
       if (!cfg.enabled) { diag.lastSkip = 'plugin-disabled'; return }
       runtime.library.config = cfg
 
+      const content = Array.isArray(message.content) ? message.content : []
+
+      /**
+       * 跳过 **DSH 自己注入的运行时上下文**。
+       *
+       * 这类消息长这样（`user/message`，`source.kind` 也是 user，但内容固定）：
+       *   `Current runtime context. This snapshot supersedes earlier ...`
+       * 它不是群友说的话，也没有图，但以前会被当成普通用户消息走完整流程，
+       * 白白占用 skipped 计数（真机上「跳过：这条消息没图 x99」里很大一部分是它），
+       * 还会污染 tracker 的活跃度与语境。
+       *
+       * 判据：文本以 "Current runtime context" 开头且**没有图片块**。
+       * 有图的绝不跳（防止误杀真正带图的消息）。
+       */
+      const hasImageBlock = content.some((block) => block?.type === 'image' && block.attachment)
+      if (!hasImageBlock && isInjectedContext(content)) {
+        diag.skippedContext = num(diag.skippedContext, 0) + 1
+        return
+      }
+
       runtime.tracker.noteUserMessage(sessionId, message)
 
-      const content = Array.isArray(message.content) ? message.content : []
-      const imageCount = content.filter((block) => block?.type === 'image' && block.attachment).length
+      const imageCount = hasImageBlock
+        ? content.filter((block) => block?.type === 'image' && block.attachment).length
+        : 0
       if (imageCount > 0) {
         diag.withImage++
         diag.lastImageAt = Date.now()
@@ -1072,6 +1093,28 @@ async function listKnownSessions(ctx, runtime) {
     }
   } catch { /* 拿不到就返回空，调用方会报告原因 */ }
   return fromTracker
+}
+
+/**
+ * 这条消息是不是 DSH 自己注入的运行时上下文（不是群友说的话）。
+ *
+ * 判据尽量保守 —— 只认**同时满足**两条的：
+ *  ① 只有 text 块（没有 image / file）；
+ *  ② 第一段文本以 `Current runtime context` 开头（DSH 的固定前缀）。
+ *
+ * 保守的好处：万一 DSH 以后改了文案，也只是"不跳过"（行为退回旧版），
+ * 不会误杀真正的用户消息。
+ *
+ * @param {Array<object>} content
+ * @returns {boolean}
+ */
+function isInjectedContext(content) {
+  if (!Array.isArray(content) || content.length === 0) return false
+  const texts = content.filter((block) => block?.type === 'text' && typeof block.text === 'string')
+  if (texts.length !== content.length) return false
+  if (texts.length === 1 && texts[0].text.trim().startsWith('Current runtime context')) return true
+  // 多段文本时看第一段（DSH 的注入总是在最前面）
+  return texts.length > 1 && String(texts[0].text).trim().startsWith('Current runtime context')
 }
 
 /**

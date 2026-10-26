@@ -380,7 +380,10 @@ await check('organize：假 vision 按 page 调用并累计结果', async () => 
   assert.deepEqual(rows.map((row) => row.count), [2, 2, 1], `应按 organizeBatchSize 分页，实际 ${JSON.stringify(rows)}`)
   assert.equal(visionCalls.length, 3, 'vision 应被调 3 次')
   assert.deepEqual(done.result, {
-    tried: 5, tagged: 5, meaningless: 0, failures: 0, deleted: 0, suspicious: false, dryRun: false, detail: '',
+    tried: 5, tagged: 5, meaningless: 0, failures: 0, deleted: 0, suspicious: false, dryRun: false,
+    // persisted=true 表示"真的写进库了"（dryRun=false）。UI 靠它区分
+    // 「打标了」和「只是试运行、其实没写」（真机踩过这个歧义）。
+    persisted: true, detail: '',
   })
   assert.deepEqual(done.progress, { done: 5, total: 5, label: '已看 5/5 张' }, '进度应报满并带「已看 x/y 张」')
 })

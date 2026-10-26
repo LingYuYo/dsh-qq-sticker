@@ -239,10 +239,32 @@ export class Collector {
       const readImage = this.deps.readImage
       if (typeof readImage !== 'function') return { ok: false, reason: '宿主没有提供读取图片的通道' }
       const prepared = []
+      // 记录失败的具体原因（Bug 3：以前只 failed++，完全看不到这 16 张为啥失败）
+      const failures = []
+      const pushFailure = (line) => {
+        failures.push(line)
+        if (failures.length <= 200) this.log('warn', line)
+      }
       await Promise.all(ranked.map((entry) => this._limit(async () => {
+        const refLabel = String(entry.ref?.attachmentId ?? '').slice(0, 20) || '(无 id)'
         try {
-          const stored = await readImage(entry.ref)
-          if (!stored?.data?.length) { out.failed++; return }
+          let stored
+          try {
+            stored = await readImage(entry.ref)
+          } catch (error) {
+            // 读图本身抛错：最常见是附件已被 DSH 清理 / 权限 / IO
+            out.failed++
+            pushFailure(`读图失败 [${refLabel}] ${entry.ref?.mediaType ?? '?'} ${entry.ref?.bytes ?? '?'}B: ${error?.message ?? error}`)
+            return
+          }
+          if (!stored?.data?.length) {
+            out.failed++
+            // 没有字节是最常见的失败：附件 id 存在但读不出来
+            // （DSH 的附件可能已被清理，readImage 返回空）
+            pushFailure(`读不到字节 [${refLabel}] ${entry.ref?.mediaType ?? '?'} ${entry.ref?.bytes ?? '?'}B`
+              + `${entry.ref?.rawToken ? '（有 rawToken 但原始池里没有/已过期）' : ''}`)
+            return
+          }
           const result = await this.library.ingest({
             bytes: stored.data,
             sessionId: '',
@@ -254,16 +276,26 @@ export class Collector {
             height: stored.fromRaw ? undefined : entry.ref.height,
             mediaType: stored.fromRaw ? stored.mediaType : entry.ref.mediaType,
           })
-          if (!result.ok) { out.failed++; return }
+          if (!result.ok) {
+            out.failed++
+            // ingest 拒绝的原因很具体（单张太大 / 容量满 / 格式不认 / 写盘失败）
+            pushFailure(`入库被拒 [${refLabel}] ${result.reason ?? '未知原因'}`)
+            return
+          }
           if (result.duplicate) { out.already++; return }
           prepared.push({ item: result.item, count: entry.count })
         } catch (error) {
           out.failed++
-          this.log('debug', `候选收图失败：${error?.message ?? error}`)
+          pushFailure(`异常 [${refLabel}] ${error?.message ?? error}`)
         }
       })))
       out.collected = prepared.length
       out.items = prepared.slice(0, want).map((entry) => ({ id: shortId(entry.item), count: entry.count }))
+      // 失败明细：面板与报表都能看到「为什么这 N 张没收进来」
+      if (failures.length) {
+        out.failures = failures.slice(0, 50)
+        out.failureCount = failures.length
+      }
 
       // ⑤⑥ 收满就停（这里已经在上面不收超过候选；真正"收几个"由 limit 控制）
       if (out.collected < want) out.stopReason = '候选不够'
@@ -366,5 +398,11 @@ export function summarizeResult(result) {
     failed: result.failed ?? 0,
     considered: result.considered ?? 0,
     stopReason: result.stopReason ?? '',
+    // 失败明细：面板「上次自动收集」那行与报表都要能说清为什么失败，
+    // 否则用户只看到「失败 16 张」却无从下手。
+    ...(Array.isArray(result.failures) && result.failures.length
+      ? { failures: result.failures.slice(0, 20) }
+      : {}),
+    ...(result.diag ? { diag: result.diag } : {}),
   }
 }

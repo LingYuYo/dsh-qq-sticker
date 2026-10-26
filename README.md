@@ -71,6 +71,7 @@ dsh-qq-sticker/
   test-gif.mjs            # 15 条：GIF 收集放宽 / 原始图池 / 发送位置与 sub_type
   test-rawimage.mjs       # 13 条：桥接↔插件原始图转交协议（/raw-image + 冻结对象 + [[qqimg:]] 对齐）
   test-llm-call.mjs       # 7 条：prepareCall 与 stream 配置一致（打标报错的回归守卫）
+  test-persist.mjs        # 10 条：打标落盘 / 注入上下文识别 / 收集失败诊断
   docs/
     settings-save-troubleshooting.md  # 「保存失败 / 需重启」的根因与排查（含实测证据）
 ```
@@ -298,6 +299,7 @@ node test-config-writable.mjs      # 8 条：Config 可写性（源码 13 段/65
 node test-gif.mjs                  # 15 条：GIF 收集放宽 / 原始图池 / 发送位置 / sub_type
 node test-rawimage.mjs             # 13 条：原始图转交协议（/raw-image + 冻结对象 + [[qqimg:]] 对齐）
 node test-llm-call.mjs             # 7 条：prepareCall/stream 配置一致（防「config changed」回归）
+node test-persist.mjs              # 10 条：打标落盘 / 注入上下文识别 / 收集失败诊断
 ```
 
 全部**不联网、不起进程、不碰 DSH**。`--real-cordis` 会自己去找

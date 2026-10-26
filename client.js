@@ -1136,6 +1136,11 @@ window.__ModuleLoader__.load({
       if (Number(result.already) > 0) parts.push(`跳过已入库 ${result.already} 张`)
       if (Number(result.failed) > 0) parts.push(`失败 ${result.failed} 张`)
       if (result.stopReason) parts.push(String(result.stopReason))
+      // 失败明细：直接接在后面，让用户一眼看到「为什么失败」。
+      // 以前只有「失败 16 张」这个数字，完全无从下手。
+      if (Array.isArray(result.failures) && result.failures.length > 0) {
+        parts.push(`失败原因：${result.failures.slice(0, 2).join('；')}`)
+      }
       return parts.join('，')
     }
 
@@ -2571,14 +2576,17 @@ window.__ModuleLoader__.load({
     function resultLines(kind, result) {
       if (!result) return []
       if (kind === 'organize') {
-        const lines = [
-          `看了 ${result.tried ?? 0} 张，打上标签 ${result.tagged ?? 0} 张`,
-        ]
+        const tryRun = result.dryRun === true || result.persisted === false
+        const lines = tryRun
+          // 试运行时这些数字只是"如果写入会怎样"，必须说清楚，否则用户会以为
+          // 打标成功了（真机踩过：显示 60/60 完成，刷新后仍「待打标 118」）。
+          ? [`试运行：看了 ${result.tried ?? 0} 张，本来可以打上标签 ${result.tagged ?? 0} 张`]
+          : [`看了 ${result.tried ?? 0} 张，打上标签 ${result.tagged ?? 0} 张（已写入库）`]
         if (result.meaningless) lines.push(`判「无意义」${result.meaningless} 张`)
         if (result.deleted) lines.push(`删除 ${result.deleted} 张`)
         if (result.failures) lines.push(`失败 ${result.failures} 张`)
         if (result.suspicious) lines.push('本批失败比例偏高，判为可疑批次（未自动删图）')
-        if (result.dryRun) lines.push('这是试运行，库未改动')
+        if (tryRun) lines.push('⚠️ 这是试运行，库没改。关掉「试运行」再跑才会真的写标签。')
         if (result.detail) lines.push(String(result.detail))
         return lines
       }
@@ -2598,6 +2606,11 @@ window.__ModuleLoader__.load({
         ]
         if (result.already) lines.push(`跳过已在库的 ${result.already} 张`)
         if (result.failed) lines.push(`失败 ${result.failed} 张`)
+        // 失败明细：说清是"读不到字节"还是"太大/格式不认/容量满"
+        if (Array.isArray(result.failures) && result.failures.length > 0) {
+          for (const line of result.failures.slice(0, 5)) lines.push(`· ${line}`)
+          if (result.failureCount > 5) lines.push(`（还有 ${result.failureCount - 5} 条，见 Console）`)
+        }
         if (result.stopReason) lines.push(String(result.stopReason))
         return lines
       }
