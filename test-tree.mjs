@@ -23,7 +23,7 @@ import { Library } from './src/library.js'
 import { createJobs } from './src/jobs.js'
 import { createActions } from './src/actions.js'
 import { DEFAULTS, readConfig } from './src/config.js'
-import { isSendable, migrateLayout, walkImageFiles } from './src/tree.js'
+import { isSendable, migrateLayout, rootTagFromName, walkImageFiles } from './src/tree.js'
 import { buildTools, TOOL_PREFIX } from './src/tools.js'
 import { shortId } from './src/library.js'
 
@@ -614,6 +614,140 @@ await check('send 工具：拿未识别编号硬发 → 抛错，不是发出去
   })
 })
 
+// ════════════════════════════════════════════════════════════ 3.5 文件名映射与自动改名（铁律二）
+
+console.log('\n== 根目录文件名 = 标签声明')
+
+await check('rootTagFromName：解析各种写法的第一个词', async () => {
+  const cases = [
+    ['开心.jpg', '开心'],
+    ['开心_1d5f.jpg', '开心'],
+    ['开心_1d5f_未识别.jpg', '开心'],
+    ['开心_随便打的字.jpg', '开心'],
+    ['未识别_1d5f.jpg', ''],      // 占位名不产生标签
+    ['a1b2c3d4e5f6a7b8.jpg', ''], // 纯哈希 = 未识别
+    ['dsfgsdfg.jpg', 'dsfgsdfg'],  // 乱码但确实是一个词 → 当标签
+    ['难过_9a8b.png', '难过'],
+  ]
+  for (const [name, want] of cases) {
+    assert.equal(rootTagFromName(name), want, `${name} 应解析成 "${want}"`)
+  }
+})
+
+await check('根目录 开心.jpg（无哈希）→ 按标签归类并强制改名为 开心_<哈希>.jpg', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const stray = path.join(dir, 'images', '开心.jpg')
+    await mkdir(path.dirname(stray), { recursive: true })
+    await writeFile(stray, makePng(10, 10, 91))
+
+    const result = await sync(runtime)
+    const files = await walkImageFiles(path.join(dir, 'images'))
+    assert.equal(files.length, 1)
+    const rel = files[0].rel
+    assert.match(rel, /^已识别\/开心\/开心_[0-9a-f]{4}\.jpg$/, `实际 ${rel}`)
+    assert.equal(await stat(stray).then(() => true, () => false), false, '原文件应被移走')
+    assert.ok(result.retagged >= 1, '应计入改标签')
+  })
+})
+
+await check('根目录 开心_1d5f.jpg：文件名里的哈希认库；不在库的就按哈希归类', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 92) })
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `开心_${hash}.jpg`)  // 随手改名，没放进子目录
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, ['开心'], '文件名第一个词就是标签')
+    assert.equal(item.pending, false)
+    assert.equal(item.file, `已识别/开心/开心_${hash}.jpg`)
+    assert.equal(await stat(item.path).then((info) => info.isFile()), true)
+  })
+})
+
+await check('根目录 开心_随便打的字.jpg：乱写的尾巴也必须规范成 开心_<哈希>.jpg', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 93) })
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `沙雕_我随手写的注释.jpg`)
+
+    await sync(runtime)
+    assert.deepEqual(item.tags, ['沙雕'])
+    assert.equal(item.file, `已识别/沙雕/沙雕_${hash}.jpg`, '改名必须用真实哈希，不许留着乱码')
+  })
+})
+
+await check('根目录 未识别_<哈希>.png：留在根目录、保持未识别、不改名', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 94) })
+    const before = item.file
+    const result = await sync(runtime)
+    assert.equal(item.file, before, '规范名不该被动')
+    assert.deepEqual(item.tags, [])
+    assert.equal(item.pending, false)
+    assert.equal(result.retagged, 0)
+  })
+})
+
+await check('根目录纯哈希名 a1b2c3d4e5f6.jpg：认出库里条目，改名成 未识别_<前4位>.jpg', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 95) })
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `a1b2c3d4e5f6.jpg`)
+
+    // 手动把索引也指向这个名字，模拟用户改名后重启
+    const result = await sync(runtime)
+    const files = await walkImageFiles(path.join(dir, 'images'))
+    const root = files.filter((file) => !file.rel.includes('/'))
+    assert.equal(root.length, 1, `根目录应只剩 1 个文件，实际 ${root.map((f) => f.rel).join(',')}`)
+    assert.equal(root[0].rel, `未识别_${hash}.jpg`)
+    assert.deepEqual(item.tags, [])
+    assert.equal(result.deleted, 0, '绝不删')
+  })
+})
+
+await check('认不出库的陌生文件：只移动/改名，**一个都不删**，并登记进库', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    // 按铁律二：「去掉后缀的词」就是标签，所以 随便一张.jpg 也算标签「随便一张」；
+    // 只有纯哈希 / 未识别_ 开头 / 解析不出词 的才当未识别。
+    const files = [
+      ['开心.jpg', /^已识别\/开心\/开心_[0-9a-f]{4}\.jpg$/],
+      ['a1b2c3d4e5f6a7b8.jpg', /^未识别_[0-9a-f]{4}\.jpg$/],
+      ['未识别_zzzz.jpg', /^未识别_[0-9a-f]{4}\.jpg$/],
+    ]
+    await mkdir(imagesDir, { recursive: true })
+    // 每张填充不同 → 内容哈希不同，否则会被内容去重当成同一张
+    for (let i = 0; i < files.length; i++) {
+      await writeFile(path.join(imagesDir, files[i][0]), makePng(10, 10, 30 + i * 7))
+    }
+    assert.equal(library.items.length, 0, '一开始库里没有条目')
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 0, '根目录一个都不许删')
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 3, `三张都该还在，实际 ${after.length}`)
+    for (let i = 0; i < files.length; i++) {
+      const [, pattern] = files[i]
+      assert.ok(after.some((file) => pattern.test(file.rel)), `缺少匹配 ${pattern} 的文件：${after.map((f) => f.rel).join(',')}`)
+    }
+    // 铁律二：用户塞进来的图要真的进库（不然发不了、也永远不会被打标）
+    assert.equal(library.items.length, 3, `三张都该登记进库，实际 ${library.items.length}`)
+    assert.equal(result.adopted, 3, 'adopted 应报 3')
+    const tagged = library.items.filter((item) => item.tags.includes('开心'))
+    assert.equal(tagged.length, 1, '开心.jpg 应带上「开心」标签')
+    assert.equal(tagged[0].pending, false, '有标签就不是待确认')
+    const rest = library.items.filter((item) => !item.tags.includes('开心'))
+    assert.equal(rest.every((item) => item.tags.length === 0 && item.pending === true), true, '纯哈希/未识别_ 的应保持未识别')
+    assert.equal(library.visible().length, 1, '只有 开心.jpg 那张能发')
+  })
+})
+
 // ════════════════════════════════════════════════════════════ 4. 清理 / 孤儿
 
 console.log('\n== 清理与孤儿文件')
@@ -636,24 +770,28 @@ await check('cleanup：无意义图按标签判定，tagFails=0 / 1 也会被识
   })
 })
 
-await check('pruneOrphanFiles：只清我们自己命名的孤儿图，不动用户文件', async () => {
+await check('pruneOrphanFiles：**一个文件都不删**（2026-10-27 误删事故的回归）', async () => {
   await withTempDir(async (dir) => {
     const lib = new Library({ dataDir: dir, config: cfgOf(), log: () => {} })
     await lib.load()
     const { item } = await lib.ingest({ bytes: makePng(24, 24, 31) })
     await lib.flush()
-    // 我们的命名格式但索引里没有 → 该清（根目录）
+    // 我们的命名格式、但索引里没有 → 以前会被删，现在必须留着
     const orphan = path.join(dir, 'images', '未识别_dead.png')
     await writeFile(orphan, makePng(10, 10, 1))
-    // 用户自己放的文件 → 不能清
+    // 用户随手丢进来的文件
     const stray = path.join(dir, 'images', '随手存的.jpg')
     await writeFile(stray, makePng(10, 10, 2))
+    // 用户手动塞的乱码哈希名文件（截图里被误删的就是这种）
+    const junk = path.join(dir, 'images', 'a1b2c3d4e5f6a7b8.jpg')
+    await writeFile(junk, makePng(10, 10, 3))
 
     const removed = await lib.pruneOrphanFiles()
-    assert.equal(removed, 1)
-    assert.equal(await stat(orphan).then(() => true, () => false), false)
-    assert.equal(await stat(stray).then(() => true, () => false), true)
-    assert.equal(await stat(item.path).then(() => true, () => false), true, '在库里的图不能被当孤儿')
+    assert.equal(removed, 0, '不许删任何东西')
+    for (const file of [orphan, stray, junk]) {
+      assert.equal(await stat(file).then(() => true, () => false), true, `${path.basename(file)} 不该被删`)
+    }
+    assert.equal(await stat(item.path).then(() => true, () => false), true, '在库里的图也不能动')
   })
 })
 

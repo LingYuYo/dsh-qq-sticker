@@ -12,6 +12,7 @@
  *    而"物理删除"只发生在容量淘汰与清理，且都过 dryRun/保底。
  */
 import path from 'node:path'
+import { readFile } from 'node:fs/promises'
 
 import { MOOD_WORDS } from './config.js'
 import {
@@ -416,6 +417,64 @@ export class Library {
   }
 
   /**
+   * 把**用户手动放进磁盘**的图片登记进库（文件已经在那了，不要再复制一份）。
+   *
+   * 为什么要这个：用户会把图直接拖进 `images/`（甚至改好名再拖）。铁律要求
+   * 扫描时「更新数据库记录」，可那些文件本来就不在索引里 —— 只挪文件不够，
+   * 条目得真的建出来，否则它永远发不了也永远不会被打标。
+   *
+   * 与 ingest 的区别：**不做容量淘汰、不重名抢位**（文件已经在目标位置了）。
+   *
+   * @param {object} input
+   * @param {string} input.abs 文件绝对路径
+   * @param {string} input.rel 相对 images/ 的 POSIX 路径
+   * @param {string} [input.hash] 已知哈希（4+ 位）；缺省按内容算
+   * @param {string[]} [input.tags] 初始标签（文件名解析出来的）
+   * @param {boolean} [input.pending]
+   * @returns {Promise<object|null>} 新条目，或 null（不是图片 / 已在库里）
+   */
+  async adoptFile({ abs, rel, hash, tags = [], pending = false } = {}) {
+    await this.load()
+    if (!abs || !rel) return null
+    let bytes
+    try {
+      bytes = await readFile(abs)
+    } catch {
+      return null
+    }
+    const sniff = sniffImage(bytes)
+    if (!sniff) return null
+    const src = sha1(bytes)
+    const key = `src:${src}`
+    if (this._byKey.has(key)) return null
+
+    const item = emptyItem()
+    item.key = key
+    item.src = src
+    item.file = toPosix(rel)
+    item.path = abs
+    item.bytes = bytes.length
+    item.ext = sniff.ext
+    item.animated = sniff.mediaType === 'image/gif'
+    item.source = 'observed'
+    item.createdAt = Date.now()
+    const dim = dimensionsOf(bytes, sniff.ext)
+    item.width = dim.width
+    item.height = dim.height
+    item.tags = [...new Set((tags ?? []).map((tag) => String(tag).trim()).filter(Boolean))].slice(0, 6)
+    item.pending = pending === true || item.tags.length === 0
+    // 用户手动塞进来的，记一笔，方便排障
+    item.manualTag = item.tags[0] ?? ''
+    item.manualTagAt = item.tags.length > 0 ? Date.now() : 0
+    if (!item.width || !item.height) { /* 认不出尺寸就留 0，不影响发送 */ }
+
+    this.items.push(item)
+    this._byKey.set(key, item)
+    this.touch()
+    return item
+  }
+
+  /**
    * 容量检查：超限就按「最少发 → 最久没用 → 最早入库」淘汰，直到合规。
    * 腾不出空间（比如只剩保底张数）就拒绝收新的。
    *
@@ -632,27 +691,26 @@ export class Library {
     return { adopted, moved, layout }
   }
 
-  /** 清掉分类目录里没有任何条目引用、且文件名是我们自己起的图片（索引损坏后的收尾）。 */
+  /**
+   * 收尾：**只报告，不删除**。
+   *
+   * ⚠️ 2026-10-27 底线事故：这个函数以前会把「文件名长得像哈希、但索引里没有」
+   * 的文件当成孤儿 unlink 掉 —— 用户手动丢进 images/ 根目录的图就是这么没的。
+   * 现在的铁律：**除了 待删除/ 和 无意义/待删除/，任何图片文件都不删**。
+   * 孤儿文件留给用户在「确认应用本地整理」里归类（那个流程只移动不删除）。
+   *
+   * @returns {Promise<number>} 恒为 0（保留返回值形状，调用方不用改）
+   */
   async pruneOrphanFiles() {
     const referenced = new Set(this.items.map((item) => toPosix(item.file)).filter(Boolean))
     const files = await walkImageFiles(this.imagesDir)
-    let removed = 0
-    for (const file of files) {
-      if (referenced.has(file.rel)) continue
-      // 人工暂存区不碰：用户可能刚挪过来还没点同步
-      const staging = [
-        `${TREE_DIRS.identified}/${TREE_DIRS.pending}/`,
-        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewRestore}/`,
-        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewDelete}/`,
-      ]
-      if (staging.some((prefix) => file.rel.startsWith(prefix))) continue
-      // 用户自己丢进来的图片不碰（只清 `<标签>_<hash>.<ext>` / 旧版哈希名）
-      if (!isOurFileName(file.name)) continue
-      await removeFile(file.abs)
-      removed++
+    const orphans = files.filter((file) => !referenced.has(file.rel))
+    if (orphans.length > 0) {
+      this.log('warn', `发现 ${orphans.length} 个索引里没有引用的图片文件（**没有删除**，点「确认应用本地整理」可归类）：`
+        + orphans.slice(0, 5).map((file) => file.rel).join('、')
+        + `${orphans.length > 5 ? ' 等' : ''}`)
     }
-    if (removed > 0) this.log('info', `清掉 ${removed} 个无人引用的图片文件`)
-    return removed
+    return 0
   }
 
   /** 报表：库里现在什么状况。 */

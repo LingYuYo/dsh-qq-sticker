@@ -146,12 +146,21 @@ export function hashOf(item, len = 4) {
   return (hash || 'xxxx').slice(0, Math.max(1, len))
 }
 
-/** 条目的图片扩展名（不带点）。 */
+/**
+ * 条目的图片扩展名（不带点）。
+ *
+ * 优先用**磁盘上文件名**的后缀：用户把图改名为 `开心_随便打的字.jpg` 时，规范化
+ * 后的目标名也该保留他这个后缀（而不是偷偷改成 sniff 出来的真格式）。文件名后缀
+ * 不是图片格式时再退回 `item.ext`（入库时 sniff 出来的真格式）。
+ */
 export function extOf(item) {
-  const ext = String(item?.ext ?? '').trim().toLowerCase()
-  if (ext) return ext
   const match = /\.([a-z0-9]+)$/i.exec(toPosix(item?.file ?? ''))
-  return (match?.[1] ?? 'jpg').toLowerCase()
+  if (match) {
+    const fromFile = match[1].toLowerCase()
+    if (IMAGE_EXT_RE.test(`.${fromFile}`)) return fromFile
+  }
+  const ext = String(item?.ext ?? '').trim().toLowerCase()
+  return ext || 'jpg'
 }
 
 /**
@@ -236,11 +245,49 @@ export function isSendable(item, config) {
   return true
 }
 
-/** 是不是我们命名的图片文件（清理孤儿时用；用户自己丢进来的文件不碰）。 */
+/** 是不是我们命名的图片文件（**只用于识别命名格式，绝不能用来决定删不删**）。 */
 export function isOurFileName(name) {
   const base = path.basename(String(name ?? ''))
   if (tokensOfName(base).some((token) => HASH_TOKEN_RE.test(token))) return true
   return /^[0-9a-f]{4,40}(?:-\d+)?\.[a-z0-9]+$/i.test(base)
+}
+
+/**
+ * 从**根目录**文件名解析新标签（铁律二）。
+ *
+ *   `开心.jpg`            → 开心      （去掉扩展名就是标签）
+ *   `开心_1d5f.jpg`       → 开心      （第一个下划线前的词）
+ *   `开心_随便打的字.jpg`  → 开心
+ *   `开心_1d5f_未识别.jpg` → 开心      （只看第一段）
+ *   `未识别_1d5f.jpg`     → ''        （未识别占位名，不产生标签）
+ *   `a1b2c3d4.jpg`        → ''        （纯哈希/乱码，当未识别）
+ *
+ * @param {string} name 文件名
+ * @returns {string} 标签名，或 '' 表示没有标签（当未识别）
+ */
+export function rootTagFromName(name) {
+  const base = path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, '')
+  const first = base.split('_')[0].trim()
+  if (!first) return ''
+  // 占位名 / 纯哈希 → 没有标签
+  if (first === TREE_DIRS.untagged) return ''
+  if (first === TREE_DIRS.pending) return ''
+  if (first === TREE_DIRS.identified) return ''
+  if (first === TREE_DIRS.meaningless) return '无意义'
+  if (HASH_TOKEN_RE.test(first)) return ''
+  return sanitizeTagName(first)
+}
+
+/**
+ * 根目录文件名是不是已经规范。
+ *
+ * 规范 = `未识别_<4~40位hex>.<ext>`，或 `<标签>_<4~40位hex>.<ext>`。
+ * 不规范就要改名（用户随便写 `开心.jpg` / `dsfgsdfg.jpg` 都算）。
+ */
+export function isCanonicalRootName(name) {
+  const base = path.basename(String(name ?? ''))
+  const match = /^(.+?)_([0-9a-f]{4,40}(?:-\d+)?)\.[a-z0-9]+$/i.exec(base)
+  return Boolean(match)
 }
 
 /** 建好基础目录（幂等）：三个顶层 + 待确认分类 + 无意义/待恢复 + 无意义/待删除。 */
@@ -643,17 +690,42 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
     }
 
     if (!item) {
-      // 认不出库条目：散图 / 无意义待恢复 仍按用户意图挪位置
+      // ⚠️ 铁律一：认不出库条目也**绝不删**。根目录的未知文件按名字当未识别/按标签归类。
       if (category.kind === 'untagged') {
-        // 根目录本来就是未识别的位置，陌生文件就让它待着
-        unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（插件不自动导入陌生文件）' })
+        const tag = rootTagFromName(file.name)
+        // 读一次字节算哈希（改名要用）。读不出来就跳过，保持原样不动。
+        let hash = hashInName(file.name)
+        if (!hash) {
+          try { hash = sha1(await readFile(file.abs)).slice(0, 4) } catch { hash = '' }
+        }
+        if (!hash) {
+          unknown.push({ rel: file.rel, name: file.name, reason: '读不出这张图（没动它）' })
+          continue
+        }
+        const ext = extOf({ file: file.name })
+        if (tag) {
+          moves.push({
+            from: file.rel,
+            fromAbs: file.abs,
+            to: placementRel('identified', tag, hash.slice(0, 4), ext),
+            tag,
+            orphan: true,
+          })
+        } else {
+          const canonicalRel = placementRel('untagged', '', hash.slice(0, 4), ext)
+          if (file.rel !== canonicalRel) {
+            moves.push({ from: file.rel, fromAbs: file.abs, to: canonicalRel, tag: '', orphan: true })
+          } else {
+            unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（命名已规范，保持在根目录未识别）' })
+          }
+        }
         continue
       }
       if (category.kind === 'identified-root'
         || (category.kind === 'meaningless' && category.review === 'restore')) {
         let hash = hashInName(file.name)
         if (!hash) {
-          try { hash = sha1(await readFile(file.abs)).slice(0, 4) } catch { hash = '' }
+          try { hash = sha1(await readFile(file.abs)).slice(0, 4); } catch { hash = ''; }
         }
         if (hash) {
           const to = category.kind === 'meaningless'
@@ -663,7 +735,7 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
           continue
         }
       }
-      unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（插件不自动导入陌生文件）' })
+      unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（没动它）' })
       continue
     }
 
@@ -723,8 +795,15 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
         desiredPending = false
       }
     } else if (category.kind === 'untagged') {
-      // 根目录 = 未识别：清空标签，别想混进发送池
-      if ((item.tags ?? []).length > 0 || item.pending === true) {
+      // 根目录 = 未识别。但铁律二：根目录的**文件名本身就是标签声明** ——
+      // `开心.jpg` / `开心_1d5f.jpg` / `开心_随便打的字.jpg` 都要按标签归类并规范化改名。
+      const fileTag = rootTagFromName(file.name)
+      if (fileTag) {
+        desiredTags = [fileTag]
+        desiredPending = false
+        manual = true
+      } else if ((item.tags ?? []).length > 0 || item.pending === true) {
+        // 文件名不带标签（`未识别_xxx` / 纯哈希）：清空标签，保持在根目录
         desiredTags = []
         desiredPending = false
         manual = true
@@ -827,7 +906,9 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     return result
   }
 
-  // ① 删除区：物理删文件 + 删索引条目（认不出的文件也删）
+  // ① 删除区：物理删文件 + 删索引条目。
+  //    ⚠️ 铁律一：**只有** 待删除/ 与 无意义/待删除/ 下的文件会走到这里。
+  //    根目录、已识别、未识别、无意义（非待删除）里的任何文件都不会被删。
   for (const entry of plan.deletes) {
     try {
       if (entry.item) {
@@ -848,7 +929,7 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     }
   }
 
-  // ② 认不出条目、但用户要求挪位置的文件（只动文件）
+  // ② 认不出条目、但按文件名归类的文件（**只移动，绝不删除**），然后登记进库
   for (const entry of plan.moves) {
     try {
       const target = await uniqueAbs(imagesDir, entry.to)
@@ -856,7 +937,18 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
       await rename(entry.fromAbs, target.abs)
       result.moved++
       if (entry.restore) result.restored++
+      else if (entry.tag) result.retagged++
       else result.pending++
+      // 铁律二：扫到用户自己塞的图，要把它真的记进库，否则永远发不了也打不了标
+      if (entry.orphan) {
+        const adopted = await library.adoptFile?.({
+          abs: target.abs,
+          rel: target.rel,
+          tags: entry.tag ? [entry.tag] : [],
+          pending: !entry.tag,
+        })
+        if (adopted) result.adopted++
+      }
     } catch (error) {
       result.errors.push(`移动 ${entry.from} 失败：${error?.message ?? error}`)
     }

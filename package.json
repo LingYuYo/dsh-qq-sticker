@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-qq-sticker",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "QQ 表情包库：把群友发的表情收进机器人自己的本地库，看图打标签，聊天时自然用出来。合并自 SnowLuma 的 5 个表情包插件。",
   "type": "module",
