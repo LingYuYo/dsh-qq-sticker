@@ -23,7 +23,9 @@ import { Library } from './src/library.js'
 import { createJobs } from './src/jobs.js'
 import { createActions } from './src/actions.js'
 import { DEFAULTS, readConfig } from './src/config.js'
-import { walkImageFiles } from './src/tree.js'
+import { isSendable, migrateLayout, walkImageFiles } from './src/tree.js'
+import { buildTools, TOOL_PREFIX } from './src/tools.js'
+import { shortId } from './src/library.js'
 
 let pass = 0
 let fail = 0
@@ -134,14 +136,16 @@ async function sync(runtime) {
 
 console.log('== 物理目录与命名')
 
-await check('入库落在 未识别/未识别_<哈希前4位>.png', async () => {
+await check('入库直接落 images/ 根目录：未识别_<哈希前4位>.png（不再有 未识别/ 子目录）', async () => {
   await withTempDir(async (dir) => {
     const lib = new Library({ dataDir: dir, config: cfgOf(), log: () => {} })
     await lib.load()
     const { item } = await lib.ingest({ bytes: makePng(24, 24, 1) })
-    const expected = `未识别/未识别_${item.src.slice(0, 4)}.png`
+    const expected = `未识别_${item.src.slice(0, 4)}.png`
     assert.equal(item.file, expected)
+    assert.equal(path.dirname(item.path), path.join(dir, 'images'), '必须直接落在 images/ 下')
     assert.equal((await stat(item.path)).size > 0, true, '文件应真的写出来')
+    assert.equal(item.tags.length, 0)
   })
 })
 
@@ -426,48 +430,83 @@ await check('已识别 根目录散图：统一搬进待确认分类并清空标
   })
 })
 
-await check('无意义/真：移进待确认分类并清空标签', async () => {
+await check('无意义/待恢复：搬回 images/ 根目录、清空标签、重新当未识别', async () => {
   await withTempDir(async (dir) => {
     const { runtime, library } = await makeRuntime(dir)
     const { item } = await library.ingest({ bytes: makePng(24, 24, 46) })
     library.annotate(item, { tags: ['无意义'] })
     await library.flush()
     const hash = item.src.slice(0, 4)
-    await moveItemTo(library, item, `无意义/真/真_${hash}.png`)
+    await moveItemTo(library, item, `无意义/待恢复/真_${hash}.png`)
 
     const result = await sync(runtime)
-    assert.deepEqual(item.tags, [])
-    assert.equal(item.pending, true)
-    assert.equal(item.file, `已识别/待确认分类/待确认分类_${hash}.png`)
-    assert.equal(result.pending, 1)
+    assert.deepEqual(item.tags, [], '标签必须清空')
+    assert.equal(item.pending, false, '不是待确认，是未识别')
+    assert.equal(item.file, `未识别_${hash}.png`, '必须回到 images/ 根目录')
+    assert.equal(path.dirname(item.path), path.join(dir, 'images'))
+    assert.equal(result.restored, 1)
     assert.equal(await stat(item.path).then((info) => info.isFile()), true)
   })
 })
 
-await check('无意义/假：条目和文件都被物理删除', async () => {
+await check('无意义/待删除：条目和文件都被物理删除', async () => {
   await withTempDir(async (dir) => {
     const { runtime, library } = await makeRuntime(dir)
     const { item } = await library.ingest({ bytes: makePng(24, 24, 47) })
     library.annotate(item, { tags: ['无意义'] })
     await library.flush()
-    const target = await moveItemTo(library, item, `无意义/假/假_${item.src.slice(0, 4)}.png`)
+    const target = await moveItemTo(library, item, `无意义/待删除/假_${item.src.slice(0, 4)}.png`)
 
     const result = await sync(runtime)
-    assert.equal(result.deleted, 1)
+    assert.equal(result.reviewDeleted, 1, '记在 reviewDeleted 上')
     assert.equal(library.items.length, 0)
     assert.equal(await stat(target).then(() => true, () => false), false)
   })
 })
 
-await check('无意义/假 里认不出库的陌生文件也物理删除（用户明确说假）', async () => {
+await check('无意义/待删除 里认不出库的陌生文件也物理删除（用户明确说要删）', async () => {
   await withTempDir(async (dir) => {
     const { runtime } = await makeRuntime(dir)
-    const stray = path.join(dir, 'images', '无意义', '假', '随便一张.jpg')
+    const stray = path.join(dir, 'images', '无意义', '待删除', '随便一张.jpg')
     await mkdir(path.dirname(stray), { recursive: true })
     await writeFile(stray, Buffer.from('not really an image, but user said delete'))
     const result = await sync(runtime)
-    assert.equal(result.deleted, 1)
+    assert.equal(result.reviewDeleted, 1)
     assert.equal(await stat(stray).then(() => true, () => false), false)
+  })
+})
+
+await check('旧布局迁移：images/未识别/ 的文件搬回根目录并删掉空目录', async () => {
+  await withTempDir(async (dir) => {
+    const imagesDir = path.join(dir, 'images')
+    const legacy = path.join(imagesDir, '未识别')
+    await mkdir(legacy, { recursive: true })
+    await writeFile(path.join(legacy, '未识别_abcd.png'), makePng(16, 16, 7))
+    await writeFile(path.join(legacy, '用户手动放的.jpg'), makePng(16, 16, 8))
+
+    const layout = await migrateLayout(imagesDir)
+    assert.equal(layout.movedToRoot, 2, `应搬回 2 张，实际 ${layout.movedToRoot}`)
+    assert.equal(await stat(legacy).then(() => true, () => false), false, '空目录应被删掉')
+    const files = await walkImageFiles(imagesDir)
+    assert.deepEqual(files.map((file) => file.rel).sort(), ['未识别_abcd.png', '用户手动放的.jpg'])
+  })
+})
+
+await check('旧布局迁移：无意义/真 → 待恢复、无意义/假 → 待删除', async () => {
+  await withTempDir(async (dir) => {
+    const imagesDir = path.join(dir, 'images')
+    await mkdir(path.join(imagesDir, '无意义', '真'), { recursive: true })
+    await mkdir(path.join(imagesDir, '无意义', '假'), { recursive: true })
+    await writeFile(path.join(imagesDir, '无意义', '真', 'a.png'), makePng(10, 10, 1))
+    await writeFile(path.join(imagesDir, '无意义', '假', 'b.png'), makePng(10, 10, 2))
+
+    const layout = await migrateLayout(imagesDir)
+    assert.ok(layout.renamed.some((line) => line.includes('待恢复')), `应报改名，实际 ${layout.renamed}`)
+    assert.ok(layout.renamed.some((line) => line.includes('待删除')))
+    assert.equal(await stat(path.join(imagesDir, '无意义', '真')).then(() => true, () => false), false)
+    assert.equal(await stat(path.join(imagesDir, '无意义', '假')).then(() => true, () => false), false)
+    assert.equal(await stat(path.join(imagesDir, '无意义', '待恢复', 'a.png')).then(() => true, () => false), true)
+    assert.equal(await stat(path.join(imagesDir, '无意义', '待删除', 'b.png')).then(() => true, () => false), true)
   })
 })
 
@@ -486,7 +525,96 @@ await check('已识别 根目录的陌生散图：也搬进待确认分类（只
   })
 })
 
-// ════════════════════════════════════════════════════════════ 3. 清理 / 孤儿
+// ════════════════════════════════════════════════════════════ 3. 发送范围（图 1 事故回归）
+
+console.log('\n== 发送范围：只有 已识别/<标签>/ 能发')
+
+await check('根目录的未识别图不能发（真机事故回归：机器人把它发给群友了）', async () => {
+  await withTempDir(async (dir) => {
+    const { library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 71) })
+    // 刚收进来：在根目录、没标签
+    assert.equal(item.file.startsWith('未识别_'), true)
+    assert.equal(library.visible().length, 0, '未识别图不能进候选池')
+    assert.equal(isSendable(item, library.config), false)
+  })
+})
+
+await check('打上标签后（已识别/开心/）才允许发送', async () => {
+  await withTempDir(async (dir) => {
+    const { library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 72) })
+    library.annotate(item, { tags: ['开心'] })
+    await library.flush()
+    assert.equal(item.file, `已识别/开心/开心_${item.src.slice(0, 4)}.png`)
+    assert.equal(isSendable(item, library.config), true)
+    assert.equal(library.visible().length, 1)
+  })
+})
+
+await check('无意义 / 待确认分类 / 待删除 的图都不允许发送', async () => {
+  await withTempDir(async (dir) => {
+    const { library } = await makeRuntime(dir)
+    const meaningless = await library.ingest({ bytes: makePng(24, 24, 73) })
+    library.annotate(meaningless.item, { tags: ['无意义'] })
+
+    const pending = await library.ingest({ bytes: makePng(24, 24, 74) })
+    library.annotate(pending.item, { tags: ['开心'] })
+    await library.flush()
+    await moveItemTo(library, pending.item, `已识别/待确认分类/待确认分类_${pending.item.src.slice(0, 4)}.png`)
+    pending.item.pending = true
+
+    const trash = await library.ingest({ bytes: makePng(24, 24, 75) })
+    library.annotate(trash.item, { tags: ['开心'] })
+    await library.flush()
+    await moveItemTo(library, trash.item, `待删除/待删除_${trash.item.src.slice(0, 4)}.png`)
+
+    for (const item of [meaningless.item, pending.item, trash.item]) {
+      assert.equal(isSendable(item, library.config), false, `${item.file} 不该能发`)
+    }
+    assert.equal(library.visible().length, 0)
+  })
+})
+
+await check('send 工具：拿未识别编号硬发 → 抛错，不是发出去', async () => {
+  await withTempDir(async (dir) => {
+    const cfg = cfgOf()
+    const library = new Library({ dataDir: dir, config: cfg, log: () => {} })
+    await library.load()
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 76) })
+    const sent = []
+    const runtime = {
+      dataDir: dir,
+      library,
+      tracker: { humanCount: () => 0, recentText: () => '', recentStickerIds: () => [], list: () => [] },
+      getConfig: () => cfg,
+      state: () => ({ sentDay: '', sentToday: 0, sessions: {} }),
+      markStateDirty: () => {},
+      log: () => {},
+      ctx: {
+        get: (name) => (name === 'tools'
+          ? { execute: async (call) => { sent.push(call); return { value: { sent: true, detail: 'ok' } } } }
+          : undefined),
+      },
+      guards: {},
+      collector: { brief: () => ({}) },
+      vision: { available: () => ({ ok: true }), recognizeBatch: async () => ({}) },
+      settler: { register: () => {} },
+      attachments: null,
+      readImageBytes: async () => null,
+    }
+    const defs = await buildTools(runtime)
+    const sendTool = defs.find((def) => def.name === `${TOOL_PREFIX}send`)
+    assert.ok(sendTool, '应有发送工具')
+    await assert.rejects(
+      () => sendTool.execute({ stickerId: shortId(item) }, { agent: { id: 's1' } }),
+      /还没完成分类/,
+    )
+    assert.equal(sent.length, 0, '不该真的调用 qq_send_image')
+  })
+})
+
+// ════════════════════════════════════════════════════════════ 4. 清理 / 孤儿
 
 console.log('\n== 清理与孤儿文件')
 
@@ -514,11 +642,11 @@ await check('pruneOrphanFiles：只清我们自己命名的孤儿图，不动用
     await lib.load()
     const { item } = await lib.ingest({ bytes: makePng(24, 24, 31) })
     await lib.flush()
-    // 我们的命名格式但索引里没有 → 该清
-    const orphan = path.join(dir, 'images', '未识别', '未识别_dead.png')
+    // 我们的命名格式但索引里没有 → 该清（根目录）
+    const orphan = path.join(dir, 'images', '未识别_dead.png')
     await writeFile(orphan, makePng(10, 10, 1))
     // 用户自己放的文件 → 不能清
-    const stray = path.join(dir, 'images', '未识别', '随手存的.jpg')
+    const stray = path.join(dir, 'images', '随手存的.jpg')
     await writeFile(stray, makePng(10, 10, 2))
 
     const removed = await lib.pruneOrphanFiles()

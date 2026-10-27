@@ -122,8 +122,10 @@ export function createActions({ runtime, jobs, log } = {}) {
         const cfg = getConfig()
         const batchSize = Math.max(1, Math.round(num(cfg?.vision?.organizeBatchSize, 4)))
         const lib = library()
-        // 候选筛选与 tools.js ORGANIZE 逐行一致：可见 + 无标签/备注/文字 + 入库早的优先
-        const candidates = lib.visible()
+        // 候选：还没打标的图（= 躺在根目录的未识别）。⚠️ 不能用 visible()——
+        // 那个现在只放行「已识别/<标签>/」里能发的图，永远轮不到待打标的。
+        const candidates = lib.alive()
+          .filter((item) => item.pending !== true && !item.tags.includes('无意义'))
           .filter((item) => item.tags.length === 0 && !item.note && !item.text)
           .sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
           .slice(0, limit)
@@ -302,8 +304,9 @@ export function createActions({ runtime, jobs, log } = {}) {
         // 保底留存与「优先删从没发过的」逻辑与 tools.js DELETE_OLDEST 一致
         const want = count
         const keep = Math.max(0, cfg.maintenance.deleteOldestKeep)
-        const visible = lib.visible()
-        const byCreatedAt = [...visible].sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
+        // 删最早按「全部存活条目」算（含还没打标的未识别图），不用 visible()
+        const alive = lib.alive()
+        const byCreatedAt = [...alive].sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
         const candidates = byCreatedAt.filter((item) => num(item.sentCount, 0) === 0)
           .concat(byCreatedAt.filter((item) => num(item.sentCount, 0) > 0))
         const allow = Math.max(0, lib.items.length - keep)
@@ -439,8 +442,10 @@ export function createActions({ runtime, jobs, log } = {}) {
         const parts = []
         if (result.retagged > 0) parts.push(`改标签 ${result.retagged} 张`)
         if (result.deleted > 0) parts.push(`物理删除 ${result.deleted} 张`)
+        if (result.reviewDeleted > 0) parts.push(`无意义/待删除 清掉 ${result.reviewDeleted} 张`)
         if (result.moved > 0) parts.push(`换位置 ${result.moved} 张`)
         if (result.pending > 0) parts.push(`转入待确认 ${result.pending} 张`)
+        if (result.restored > 0) parts.push(`退回未识别 ${result.restored} 张`)
         if (result.newTags.length > 0) parts.push(`新标签 ${result.newTags.join('、')}`)
         if (result.unknown > 0) parts.push(`${result.unknown} 个文件没对上库（未动）`)
         const detail = dryRun
@@ -452,6 +457,8 @@ export function createActions({ runtime, jobs, log } = {}) {
           matched: result.matched,
           unchanged: result.unchanged,
           deleted: result.deleted,
+          reviewDeleted: result.reviewDeleted,
+          restored: result.restored,
           retagged: result.retagged,
           moved: result.moved,
           pending: result.pending,

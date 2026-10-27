@@ -306,9 +306,14 @@ await group('Library', async () => {
       const lib = new Library({ dataDir: dir, config: cfgOf() })
       await lib.load()
       const { item } = await lib.ingest({ bytes: makePng(20, 20) })
+      // ⚠️ 2026-10-27 起 visible() 只放行「已识别/<标签>/」里能发的图，
+      //    这里必须真打上标签并等异步搬家落定，否则测的是旧的宽松语义。
+      lib.annotate(item, { tags: ['开心'] })
+      await lib.flush()
       assert.equal(lib.visible().length, 1)
       lib.hide(item)
       assert.equal(lib.visible().length, 0)
+      assert.equal(lib.alive().length, 0)
       lib.unhide(item)
       assert.equal(lib.visible().length, 1)
     })
@@ -748,7 +753,12 @@ await group('Prompt', async () => {
       const cfg = cfgOf({ send: { frequency: 'rare' } })
       const lib = new Library({ dataDir: dir, config: cfg })
       await lib.load()
-      for (let i = 0; i < 3; i++) await lib.ingest({ bytes: makePng(20, 20, i * 8) })
+      // 候选段只列「能发」的图（已识别/<标签>/），所以这 3 张必须真打标签。
+      for (let i = 0; i < 3; i++) {
+        const { item } = await lib.ingest({ bytes: makePng(20, 20, i * 8) })
+        lib.annotate(item, { tags: ['开心'] })
+      }
+      await lib.flush()
       const state = emptyState()
       state.sessions.s = { ...emptyState().sessions.s, day: todayKey(), sentToday: 3 }
       const text = buildCandidateContext({
@@ -968,6 +978,8 @@ await group('Tools', async () => {
       await lib.load()
       const { item } = await lib.ingest({ bytes: makePng(20, 20) })
       lib.annotate(item, { tags: ['开心'], note: '笑' })
+      // visible() 要求物理上已经在 已识别/开心/ 里，必须等异步搬家落定
+      await lib.flush()
       const defs = await buildTools(minimalRuntime(lib, cfg))
       const pick = defs.find((def) => def.name === TOOL.PICK)
       const out = await pick.execute({ limit: 5 }, {})

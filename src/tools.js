@@ -19,6 +19,7 @@ import { candidateLine, pickCandidates, weightedPick } from './pick.js'
 import { effectiveLimits, activityOf, sendGate, markSent } from './gate.js'
 import { MAX_DELETE_PER_RUN } from './vision.js'
 import { MOOD_WORDS } from './config.js'
+import { isSendable } from './tree.js'
 
 /** 工具名前缀（改这里就够，其他地方全部引用常量）。 */
 export const TOOL_PREFIX = 'qq_ext_sticker_'
@@ -312,6 +313,13 @@ export async function buildTools(runtime) {
       if (!item) throw new Error(`库里没有这个编号：${args?.stickerId}（先用「挑一张表情包」或「看看表情包库」确认）`)
       if (item.hidden) throw new Error(`#${shortId(item)} 已经被隐藏了，换一张。`)
       if (item.tags.includes('无意义')) throw new Error(`#${shortId(item)} 标了「无意义」，别发它。换一张。`)
+      // ⚠️ 2026-10-27 真机事故：未识别目录里的图被发出去了。
+      //    这里做最后一道硬闸 —— 模型可能拿着旧编号、或者从别处抄来一个编号，
+      //    不能只依赖候选列表不给它。
+      if (!isSendable(item, cfg)) {
+        throw new Error(`#${shortId(item)} 还没完成分类（在未识别/无意义/待确认里，或者没有标签），不能发。`
+          + '换一张已经分好类的，或者先用文字回应。这不是发不出去，别重试。')
+      }
 
       const activity = tracker.humanCount(sessionId)
       const verdict = sendGate({
@@ -735,7 +743,10 @@ export async function buildTools(runtime) {
       const cfg = requireEnabled()
       const limit = Math.min(60, Math.max(1, num(args?.limit, 12)))
       const dryRun = args?.dryRun === true
-      const candidates = library.visible()
+      // 打标候选 = 还没标签的存活条目（= 根目录里的未识别）。不能用 visible()：
+      // 那个只放行「已识别/<标签>/」里能发的图，永远轮不到待打标的。
+      const candidates = library.alive()
+        .filter((item) => item.pending !== true && !item.tags.includes('无意义'))
         .filter((item) => item.tags.length === 0 && !item.note && !item.text)
         .sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
         .slice(0, limit)
@@ -884,11 +895,12 @@ export async function buildTools(runtime) {
       const dryRun = args?.dryRun === true
       const want = Math.min(500, Math.max(1, num(args?.count, cfg.maintenance.deleteOldestCount)))
       const keep = Math.max(0, cfg.maintenance.deleteOldestKeep)
-      const visible = library.visible()
-      const candidates = [...visible]
+      // 删最早按「全部存活条目」算（含还没打标的未识别图），不用 visible()
+      const alive = library.alive()
+      const candidates = [...alive]
         .sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
         .filter((item) => num(item.sentCount, 0) === 0)
-        .concat([...visible]
+        .concat([...alive]
           .sort((a, b) => num(a.createdAt, 0) - num(b.createdAt, 0))
           .filter((item) => num(item.sentCount, 0) > 0))
       const allow = Math.max(0, library.items.length - keep)

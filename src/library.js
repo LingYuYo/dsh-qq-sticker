@@ -4,8 +4,8 @@
  * 设计取舍（都来自原 sticker-steal 的实战结论）：
  *  · 主键 = 图片字节的 sha1（内容寻址）。同一张图从任何群收进来都只存一份，
  *    "按内容去重"比"按消息 id 去重"可靠（用户会把同一张图转发很多遍）。
- *  · 图片本体按物理分类放在 images/已识别/<标签>/、无意义/、未识别/、待删除/ 下，
- *    文件名 <标签>_<哈希前4位>.<ext>；索引只记相对路径 —— 索引损坏时可以重建，
+ *  · 图片本体按物理分类放在 images/已识别/<标签>/、无意义/、images/ 根目录（未识别）、
+ *    待删除/ 下，文件名 <标签>_<哈希前4位>.<ext>；索引只记相对路径 —— 索引损坏时可以重建，
  *    图片不会跟着废掉。
  *  · 索引整份读写 + 防抖落盘：800 张规模下 ~300KB，够用；真要更大再换 sqlite。
  *  · 软删除用 hidden 集合，不删文件也不删条目 —— 模型误删可以恢复，
@@ -19,8 +19,8 @@ import {
   sha1, sniffImage, todayKey, writeBytes, writeJsonAtomic,
 } from './util.js'
 import {
-  TREE_DIRS, TREE_ROOT_NAMES, ensureTreeDirs, isOurFileName, placementRel,
-  reconcilePaths, relocateItemFile, toPosix, walkImageFiles,
+  TREE_DIRS, TREE_ROOT_NAMES, ensureTreeDirs, isOurFileName, isSendable, migrateLayout,
+  placementFor, placementRel, reconcilePaths, relocateItemFile, toPosix, walkImageFiles,
 } from './tree.js'
 
 /** 索引结构版本。不兼容的旧结构直接重来（不猜着迁移）。 */
@@ -267,14 +267,26 @@ export class Library {
     await this._saver.flush()
   }
 
-  /** 可见条目（去掉 hidden 与永久剔除）。 */
+  /**
+   * 可见条目（去掉 hidden 与永久剔除）。
+   *
+   * ⚠️ 2026-10-27 真机事故后收严：这里同时是「能给模型发」的候选来源，
+   * 所以除了 hidden / 待确认，还必须满足 isSendable：
+   *   · 至少一个标签、且不含「无意义」；
+   *   · 物理上确实在 `已识别/<标签>/` 里（根目录的未识别、无意义/、待删除/、
+   *     待确认分类/ 一律不算）。
+   * 以前只挡 hidden，结果未识别目录里没标签的图被模型挑走发出去了。
+   */
   visible() {
+    return this.items.filter((item) => isSendable(item, this.config))
+  }
+
+  /** 只按 hidden / 剔除名单过滤（统计「已打标」这类计数用，不代表能发）。 */
+  alive() {
     const blocked = new Set(this.config.library.blockedIds)
     const hiddenConfig = new Set(this.config.library.hiddenIds)
     return this.items.filter((item) => {
       if (item.hidden) return false
-      // 待确认分类：等人工分类，不参与打标/发送/删最早，避免自动流程把它抢走
-      if (item.pending === true) return false
       const sid = shortId(item)
       if (blocked.has(sid) || blocked.has(String(item.src))) return false
       if (hiddenConfig.has(sid)) return false
@@ -353,8 +365,8 @@ export class Library {
       return { ok: false, reason: verdict.reason }
     }
 
-    // 新图先落 未识别/未识别_<哈希前4位>.<ext>；打上标签后 annotate 会自动搬进
-    // 已识别/<标签名>/ 并改名（哈希位撞车时自动加长）。
+    // 新图直接落 images/ **根目录**：`未识别_<哈希前4位>.<ext>`（根目录 = 未识别）。
+    // 打上标签后 annotate 会自动搬进 已识别/<标签名>/ 并改名（哈希位撞车时自动加长）。
     let file = placementRel('untagged', '', src.slice(0, 4), sniff.ext)
     let full = path.join(this.imagesDir, file)
     let hashLen = 4
@@ -575,26 +587,36 @@ export class Library {
   }
 
   /**
-   * 把旧版平铺在 images/ 根下的文件搬进分类目录，并顺手把「索引路径丢了但文件
-   * 还在树里」的条目认回来。
+   * 启动时的目录整理（幂等）：
+   *   ① 迁移旧布局：`images/未识别/` 搬回根目录并删掉空目录；`无意义/真|假`
+   *      改名成 `无意义/待恢复|待删除`；
+   *   ② 按内容哈希把「索引里路径不对」的条目认回来（用户手动挪过图）；
+   *   ③ 把分类目录之外的老文件搬进该在的位置。
    *
-   * ⚠️ 只搬**根目录平铺**的旧文件。已经在 已识别/ 无意义/ 未识别/ 待删除/ 里的
-   * 文件不碰 —— 那可能是用户手动挪的，要等「确认应用本地整理」来读它的意图。
+   * ⚠️ 第 ③ 步只处理「不在任何分类目录里」的路径。根目录现在**就是**未识别
+   * 的合法位置，所以根目录的图不再被强行搬走。
    *
-   * @returns {Promise<{adopted:number, moved:number}>}
+   * @returns {Promise<{adopted:number, moved:number, layout:object}>}
    */
   async migrateTree() {
     await this.load()
     // 启动就把分类目录建好：用户重开 DSH 后能直接在资源管理器里看到
-    // 待确认分类/、无意义/真/、无意义/假/，不用自己猜路径
-    await ensureTreeDirs(this.imagesDir)
+    // 待确认分类/、无意义/待恢复/、无意义/待删除/，不用自己猜路径
+    const layout = await migrateLayout(this.imagesDir)
     const adopted = await reconcilePaths(this.imagesDir, this.items)
     let moved = 0
     for (const item of [...this.items]) {
       const rel = toPosix(item.file)
+      if (!rel) continue
       const top = rel.split('/')[0]
       const underTree = rel.includes('/') && TREE_ROOT_NAMES.includes(top)
       if (underTree) continue
+      // 根目录 = 未识别的合法位置：**没标签、不是待确认**的图就该待在根目录，不搬。
+      // 反过来，有标签却还在根目录（老布局残留 / 手改过索引）要搬进 已识别/<标签>/。
+      if (!rel.includes('/')) {
+        const placement = placementFor(item)
+        if (placement.category === 'untagged') continue
+      }
       try {
         const result = await relocateItemFile(this.imagesDir, item)
         if (result.moved) moved++
@@ -602,11 +624,12 @@ export class Library {
         this.log('warn', `旧图搬进分类目录失败（${item.file}）：${error?.message ?? error}`)
       }
     }
-    if (adopted > 0 || moved > 0) {
+    if (adopted > 0 || moved > 0 || layout.notes.length > 0) {
       this.touch()
-      this.log('info', `图片目录整理：找回 ${adopted} 条路径，搬入分类目录 ${moved} 张`)
+      this.log('info', `图片目录整理：找回 ${adopted} 条路径，搬入分类目录 ${moved} 张`
+        + `${layout.notes.length > 0 ? `；${layout.notes.join('；')}` : ''}`)
     }
-    return { adopted, moved }
+    return { adopted, moved, layout }
   }
 
   /** 清掉分类目录里没有任何条目引用、且文件名是我们自己起的图片（索引损坏后的收尾）。 */
@@ -619,8 +642,8 @@ export class Library {
       // 人工暂存区不碰：用户可能刚挪过来还没点同步
       const staging = [
         `${TREE_DIRS.identified}/${TREE_DIRS.pending}/`,
-        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewTrue}/`,
-        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewFalse}/`,
+        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewRestore}/`,
+        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewDelete}/`,
       ]
       if (staging.some((prefix) => file.rel.startsWith(prefix))) continue
       // 用户自己丢进来的图片不碰（只清 `<标签>_<hash>.<ext>` / 旧版哈希名）
@@ -641,7 +664,10 @@ export class Library {
     const shown = this.items.filter((item) => item.interactShown > 0)
     return {
       total: this.items.length,
+      /** 能发给模型的（全部条件都过：有标签 + 位于 已识别/<标签>/）。 */
       visible: visible.length,
+      /** 只排除 hidden / 剔除名单（打标候选、删最早这些用得到）。 */
+      alive: this.alive().length,
       hidden: this.items.filter((item) => item.hidden).length,
       tagged,
       untagged: this.items.length - tagged,

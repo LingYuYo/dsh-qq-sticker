@@ -2362,6 +2362,7 @@ window.__ModuleLoader__.load({
       const maxBytes = (Number(limits.maxTotalMB) || 0) * MB
       const total = Number(library.total) || 0
       const visible = Number(library.visible) || 0
+      const alive = Number(library.alive ?? library.visible) || 0
       const tagged = Number(library.tagged) || 0
       const untagged = Number(library.untagged) || 0
       const meaningless = Number(library.meaningless) || 0
@@ -2379,7 +2380,7 @@ window.__ModuleLoader__.load({
             label: '库里的表情',
             value: fmtNum(total),
             unit: '张',
-            hint: `可见 ${visible} · 隐藏 ${hidden}`,
+            hint: `可发 ${visible} · 在库 ${alive} · 隐藏 ${hidden}`,
           }),
           h(StatCard, {
             label: '占用容量',
@@ -2619,7 +2620,9 @@ window.__ModuleLoader__.load({
       if (kind === 'sync_tree') {
         const lines = [
           `扫描 ${result.scanned ?? 0} 个文件：改标签 ${result.retagged ?? 0} 张、换位置 ${result.moved ?? 0} 张、物理删除 ${result.deleted ?? 0} 张`
-            + `${result.pending ? `、转入待确认 ${result.pending} 张` : ''}`,
+            + `${result.reviewDeleted ? `（含无意义/待删除 ${result.reviewDeleted} 张）` : ''}`
+            + `${result.pending ? `、转入待确认 ${result.pending} 张` : ''}`
+            + `${result.restored ? `、退回未识别 ${result.restored} 张` : ''}`,
         ]
         if (Array.isArray(result.newTags) && result.newTags.length > 0) {
           lines.push(`新标签目录：${result.newTags.join('、')}${result.tagsSaved === false ? '（已记进库；写配置词表失败，重启后可再同步一次）' : ''}`)
@@ -2786,10 +2789,11 @@ window.__ModuleLoader__.load({
               h('span', { className: 'qqs-card-title-icon' }, h(Glyph, { name: 'folder', size: 14 })),
               '确认应用本地整理')),
           h('div', { className: 'qqs-card-desc' },
-            '图片已经按标签分好目录：已识别/<标签名>/、已识别/待确认分类/、无意义/（真/、假/）、待删除/、未识别/。',
+            '目录：images/ 根目录 = 未识别（还没打标的图）、已识别/<标签名>/、已识别/待确认分类/、',
+            '无意义/（待恢复/、待删除/）、待删除/。**只有 已识别/<标签>/ 里的图会被发出去**。',
             '改错标签就把图剪切到 已识别/待确认分类/，重命名为 新标签_原哈希.jpg（如 生气_1d5f.jpg；',
             '也可以在原名后追加，如 沙雕_1d5f_生气.jpg），再点这个按钮。',
-            '无意义/真/ 里的图会转进待确认分类并清空标签；无意义/假/ 里的图直接物理删除；',
+            '无意义/待恢复/ 里的图会退回根目录并清空标签（重新当未识别）；无意义/待删除/ 里的图物理删除；',
             '待确认分类 里新建的 开心/ 这种文件夹，目录名就是新标签。'),
           h('div', { className: 'qqs-action-ctl' },
             h(Button, {

@@ -469,6 +469,8 @@ await check('list：返回库内容行', async () => {
   await withPlugin(async ({ runtime }) => {
     const { item } = await runtime.library.ingest({ bytes: makePng(40, 40, 8) })
     runtime.library.annotate(item, { tags: ['无奈'], note: '摊手', text: '算了' })
+    // visible() 还要求物理上已在 已识别/无奈/ 里，等异步搬家落定再断言
+    await runtime.library.flush()
     const defs = await waitFor(async () => runtime.toolDefs.length > 0 && runtime.toolDefs)
     const listDef = defs.find((def) => def.name === 'qq_ext_sticker_list')
     const out = await listDef.execute({ limit: 10 }, {})

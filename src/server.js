@@ -76,6 +76,7 @@ export function registerRoutes(ctx, runtime) {
       library: {
         total: stats.total,
         visible: stats.visible,
+        alive: stats.alive,
         hidden: stats.hidden,
         tagged: stats.tagged,
         untagged: stats.untagged,
