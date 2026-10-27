@@ -460,6 +460,67 @@ await group('Ingest 判定', async () => {
     assert.ok(second.skipped.includes('replay'))
   })
 
+  await check('暂停收集（collect.enabled=false）时 onUserMessage 立刻返回，0 资源消耗', async () => {
+    const cfg = cfgOf({ collect: { enabled: false } })
+    const state = emptyState()
+    // 埋雷：一旦真的走到后面任何一步，这些钩子会被调用，测试就能抓到
+    let readImageCalls = 0
+    let ingestCalls = 0
+    const ingestor = new Ingestor({
+      library: { ingest: async () => { ingestCalls++; return { ok: true } } },
+      getConfig: () => cfg,
+      state,
+      markStateDirty: () => { },
+      deps: {
+        readImage: async () => { readImageCalls++; return { data: new Uint8Array([1, 2, 3]) } },
+      },
+    })
+    const content = [{ type: 'image', attachment: { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 10, height: 10 } }]
+
+    const result = ingestor.onUserMessage({ sessionId: 's', content })
+    assert.equal(result.queued, 0, '暂停时不该入队')
+    assert.deepEqual(result.skipped, ['collect-paused'], `应一眼看出是被暂停挡的，实际 ${JSON.stringify(result.skipped)}`)
+    assert.equal(ingestor.snapshot().queued, 0, '队列必须空')
+
+    // 等一轮事件循环，确认后台 _drain 也没去读图/写库
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(readImageCalls, 0, '暂停时绝不能下载图片')
+    assert.equal(ingestCalls, 0, '暂停时绝不能写库')
+    assert.equal(state.ingest.hourCount, 0, '暂停时不该消耗每小时份额')
+  })
+
+  await check('暂停发生在「已入队但还没下载」之间：_ingestOne 也立刻放弃', async () => {
+    let paused = false
+    const cfg = cfgOf({ collect: { enabled: true } })
+    const state = emptyState()
+    let readImageCalls = 0
+    const ingestor = new Ingestor({
+      library: { ingest: async () => ({ ok: true, item: { tags: [], width: 1, height: 1 } }) },
+      // 现读配置：一开始开着，入队后立刻关掉
+      getConfig: () => cfgOf({ collect: { enabled: !paused } }),
+      state,
+      markStateDirty: () => { },
+      deps: { readImage: async () => { readImageCalls++; return { data: new Uint8Array([1, 2, 3]) } } },
+    })
+    const content = [{ type: 'image', attachment: { attachmentId: 'b1', mediaType: 'image/png', bytes: 10, width: 10, height: 10 } }]
+    const result = ingestor.onUserMessage({ sessionId: 's', content })
+    assert.equal(result.queued, 1)
+    // 模拟用户在下载开始前就点了暂停
+    paused = true
+    ingestor.pause()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(readImageCalls, 0, '暂停后已入队的也不许再下载')
+    assert.equal(ingestor.snapshot().queued, 0)
+    void cfg
+  })
+
+  await check('collectGate：插件关闭 / 收集暂停 / 正常 三态', async () => {
+    const make = (cfg) => new Ingestor({ library: null, getConfig: () => cfg, state: emptyState(), markStateDirty: () => { }, deps: {} })
+    assert.deepEqual(make(cfgOf({ enabled: false })).collectGate(), { ok: false, reason: 'plugin-disabled' })
+    assert.deepEqual(make(cfgOf({ collect: { enabled: false } })).collectGate(), { ok: false, reason: 'collect-paused' })
+    assert.deepEqual(make(cfgOf()).collectGate(), { ok: true })
+  })
+
   await check('每日预算计数与重置', () => {
     const cfg = cfgOf({ vision: { ingestBudgetPerDay: 2 } })
     const state = emptyState()

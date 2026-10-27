@@ -1062,6 +1062,89 @@ await check('开关类配置也能写：关掉自动收集', async () => {
 })
 
 /* ════════════════════════════════════════════════════════════
+   ⑤-b 收集总闸（概览页顶部的大开关）
+   ════════════════════════════════════════════════════════════ */
+
+console.log('\n⑤-b 收集总闸')
+
+await check('概览页顶部有「收集开关」卡，收集中时显示绿灯与「暂停收集」按钮', async () => {
+  const mount = mountMain()
+  let tree = await renderPanelSettled(mount)
+  await settle(8)
+  const card = findAll(tree, (node) => classOf(node).split(/\s+/).includes('qqs-collect-switch'))[0]
+  assert.ok(card, '概览页应有收集开关卡')
+  const text = textOf(card)
+  assert.ok(text.includes('收集开关'), `卡里该有标题，实际：${text}`)
+  assert.ok(text.includes('收集中'), '开着的状态文案')
+  const btn = findAll(card, (node) => node.type === 'button' && textOf(node) === '暂停收集')[0]
+  assert.ok(btn, '收集中时按钮文案应是「暂停收集」')
+  assert.equal(classOf(card).includes('qqs-collect-paused'), false, '没暂停时不该有 paused 类')
+  // 绿灯
+  const dot = findAll(card, (node) => classOf(node).split(/\s+/).includes('qqs-dot'))[0]
+  assert.ok(dot, '应有状态灯')
+  assert.equal(classOf(dot).includes('qqs-dot-ok'), true, `收集中应是绿灯，实际 ${classOf(dot)}`)
+})
+
+await check('点「暂停收集」写 collect.enabled=false，并弹出提示', async () => {
+  const mount = mountMain()
+  let tree = await renderPanelSettled(mount)
+  await settle(8)
+  const card = findAll(tree, (node) => classOf(node).split(/\s+/).includes('qqs-collect-switch'))[0]
+  const btn = findAll(card, (node) => node.type === 'button' && textOf(node) === '暂停收集')[0]
+  await btn.props.onClick()
+  await settle(8)
+  const hit = mount.mutations.find((entry) => entry.ops?.[0]?.path?.join('.') === 'collect.enabled')
+  assert.ok(hit, `应写入 collect.enabled，实际：${JSON.stringify(mount.mutations.map((e) => e.ops))}`)
+  assert.equal(hit.ops[0].value, false, '点「暂停收集」应写 false')
+})
+
+await check('暂停态：红灯 + 「恢复收集」按钮 + 那句提示文案', async () => {
+  const mount = mountMain()
+  // 直接把 /state 的 collect.enabled 改成 false，模拟已暂停
+  const original = STATE.collect.enabled
+  STATE.collect.enabled = false
+  try {
+    let tree = await renderPanelSettled(mount)
+    await settle(8)
+    const card = findAll(tree, (node) => classOf(node).split(/\s+/).includes('qqs-collect-switch'))[0]
+    assert.ok(card, '暂停时卡片还在')
+    assert.equal(classOf(card).includes('qqs-collect-paused'), true, '暂停时卡片应带 paused 类')
+    const text = textOf(card)
+    assert.ok(text.includes('已暂停'), `应显示「已暂停」，实际：${text}`)
+    assert.ok(
+      text.includes('当前已暂停自动收集，群友发图仅供聊天识别，不入库。'),
+      `必须显示那句提示，实际：${text}`,
+    )
+    const btn = findAll(card, (node) => node.type === 'button' && textOf(node) === '恢复收集')[0]
+    assert.ok(btn, '暂停时按钮文案应是「恢复收集」')
+    const dot = findAll(card, (node) => classOf(node).split(/\s+/).includes('qqs-dot'))[0]
+    assert.equal(classOf(dot).includes('qqs-dot-err'), true, `暂停应是红灯，实际 ${classOf(dot)}`)
+    assert.equal(text.includes('群友发图不会入库'), true)
+  } finally {
+    STATE.collect.enabled = original
+  }
+})
+
+await check('点「恢复收集」写 collect.enabled=true', async () => {
+  const mount = mountMain()
+  const original = STATE.collect.enabled
+  STATE.collect.enabled = false
+  try {
+    let tree = await renderPanelSettled(mount)
+    await settle(8)
+    const card = findAll(tree, (node) => classOf(node).split(/\s+/).includes('qqs-collect-switch'))[0]
+    const btn = findAll(card, (node) => node.type === 'button' && textOf(node) === '恢复收集')[0]
+    await btn.props.onClick()
+    await settle(8)
+    const hit = mount.mutations.find((entry) => entry.ops?.[0]?.path?.join('.') === 'collect.enabled')
+    assert.ok(hit, '应写入 collect.enabled')
+    assert.equal(hit.ops[0].value, true, '点「恢复收集」应写 true')
+  } finally {
+    STATE.collect.enabled = original
+  }
+})
+
+/* ════════════════════════════════════════════════════════════
    ⑥-c 本次重构的回归点（卡片 / 层级 / 下拉 / 折叠 / 旧 Schema）
    ════════════════════════════════════════════════════════════ */
 

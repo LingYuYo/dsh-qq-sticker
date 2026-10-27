@@ -81,7 +81,11 @@ export class Collector {
   /** 计划状态（工具/报表要显示"下次什么时候收"）。 */
   brief(now = Date.now()) {
     const cfg = this.getConfig()
-    if (cfg.collect.everyHours <= 0) return { enabled: false, nextRunAt: 0 }
+    // ⚠️ enabled 必须同时反映「定时开着」和「收集总闸开着」：
+    // 概览页的绿色 / 红色状态灯读的就是这个字段。
+    if (cfg.collect.everyHours <= 0 || !cfg.collect.enabled) {
+      return { enabled: false, everyHours: cfg.collect.everyHours, paused: !cfg.collect.enabled, nextRunAt: 0, nextRunInMin: 0 }
+    }
     const nextRunAt = this.schedule.nextRunAt > 0 ? this.schedule.nextRunAt : this.computeNextRunAt(now)
     return {
       enabled: true,
@@ -126,7 +130,7 @@ export class Collector {
   /** 到点就跑（0 小时关闭）。 */
   async maybeRun() {
     const cfg = this.getConfig()
-    if (!cfg.enabled || cfg.collect.everyHours <= 0) return { skipped: 'disabled' }
+    if (!cfg.enabled || cfg.collect.everyHours <= 0 || !cfg.collect.enabled) return { skipped: 'disabled' }
     if (this._running) return { skipped: 'busy' }
     const now = Date.now()
     let nextRunAt = this.schedule.nextRunAt
@@ -160,6 +164,9 @@ export class Collector {
   async collectTopUsed({ hours, limit, reason = 'manual' } = {}) {
     const cfg = this.getConfig()
     if (!cfg.enabled) return { ok: false, reason: '插件已关闭' }
+    // 暂停收集：连"手动/定时"这条路也一起停 —— 开关就是总闸，
+    // 不然用户点了暂停，定时收集还在后台偷偷下载。
+    if (!cfg.collect.enabled) return { ok: false, reason: '收集已暂停（设置里的「自动收集」关着）' }
     if (this._running) return { ok: false, reason: '已经有一轮收集在跑' }
     this._running = true
     const out = {
@@ -319,6 +326,7 @@ export class Collector {
   async scanSession({ sessionId, range = '4h', limit = 10 } = {}) {
     const cfg = this.getConfig()
     if (!cfg.enabled) return { ok: false, reason: '插件已关闭' }
+    if (!cfg.collect.enabled) return { ok: false, reason: '收集已暂停（设置里的「自动收集」关着）' }
     const hours = parseRange(range)
     const since = hours === Infinity ? 0 : Date.now() - hours * 3_600_000
     const readMessages = this.deps.readMessages

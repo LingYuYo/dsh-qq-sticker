@@ -732,8 +732,33 @@ window.__ModuleLoader__.load({
 .qqs-btn-ghost { background: transparent; border-color: transparent; color: var(--qqs-ink-2); }
 .qqs-btn-ghost:hover:not(:disabled) { background: var(--qqs-hover); color: var(--qqs-ink); }
 .qqs-btn-sm { font-size: 11.5px; padding: 3px 9px; border-radius: 6px; }
+.qqs-btn-lg { font-size: 14px; padding: 10px 18px; border-radius: 9px; font-weight: 600; width: 100%; justify-content: center; }
+.qqs-btn-lg .qqs-spin { width: 13px; height: 13px; }
 .qqs-btn-icon { padding: 5px; width: 28px; height: 28px; }
 .qqs-btn-icon .qqs-spin { margin: 0; }
+
+/* ── 收集总闸（概览页顶部）─────────────────────────────────── */
+.qqs-collect-switch { border-color: var(--qqs-line-strong); }
+.qqs-collect-switch.qqs-collect-paused {
+  border-color: var(--qqs-danger);
+  background: color-mix(in oklab, var(--qqs-danger) 6%, var(--qqs-surface));
+}
+.qqs-collect-state { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; font-size: 12px; }
+.qqs-collect-badge {
+  font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid currentColor;
+}
+.qqs-collect-badge.qqs-is-running { color: var(--qqs-ok); }
+.qqs-collect-badge.qqs-is-paused { color: var(--qqs-danger); }
+.qqs-collect-btnrow { display: flex; }
+.qqs-collect-note {
+  display: flex; align-items: flex-start; gap: 6px; margin-top: 10px;
+  padding: 8px 10px; border-radius: 7px; font-size: 11.5px; line-height: 1.55;
+  color: var(--qqs-danger);
+  background: var(--qqs-danger-soft);
+  border: 1px solid color-mix(in oklab, var(--qqs-danger) 35%, transparent);
+}
+.qqs-collect-note svg { flex: 0 0 auto; margin-top: 2px; }
 
 /* 转圈 */
 .qqs-spin {
@@ -1740,6 +1765,7 @@ window.__ModuleLoader__.load({
       else if (variant === 'danger') cls.push('qqs-btn-danger')
       else if (variant === 'ghost') cls.push('qqs-btn-ghost')
       if (size === 'sm') cls.push('qqs-btn-sm')
+      else if (size === 'lg') cls.push('qqs-btn-lg')
       return h('button', {
         ...rest,
         type: rest.type ?? 'button',
@@ -1747,7 +1773,7 @@ window.__ModuleLoader__.load({
         disabled: disabled === true || busy === true,
       },
       busy ? h('span', { className: 'qqs-spin', 'aria-hidden': true }) : null,
-      icon && !busy ? h(Glyph, { name: icon, size: 13 }) : null,
+      icon && !busy ? h(Glyph, { name: icon, size: size === 'lg' ? 16 : 13 }) : null,
       children)
     }
 
@@ -2350,7 +2376,61 @@ window.__ModuleLoader__.load({
       return map[text] ?? text
     }
 
-    function StatusTab({ data, onGoto, onOpenError }) {      if (!data) return h(Empty, { title: '还没有数据', desc: '等第一次状态轮询完成；如果一直停在加载中，看顶部错误提示。' })
+    /**
+     * 收集总闸（概览页最显眼的位置）。
+     *
+     * 为什么单独做一个卡片而不是让用户去设置页找：这是「现在别收图」的即时操作，
+     * 属于日常开关而非配置。写的是 `collect.enabled`（与设置页同一个字段，
+     * 两边互通）；读的状态以 `/state.collect.enabled` 为准，保证跟宿主真实值一致。
+     */
+    function CollectSwitch({ data, form, onToast }) {
+      const writer = useConfigWriter(form)
+      const { get, write, writable } = writer
+      // 宿主的现读值优先：form 的快照可能落后一次轮询
+      const liveValue = data?.collect?.enabled
+      const paused = liveValue === false || (liveValue === undefined && get('collect.enabled') === false)
+      const saving = writer.savingCount > 0
+      const disabled = !writable
+      const next = paused  // 暂停中 → 点一下恢复收集
+
+      return h('div', { className: `qqs-card qqs-collect-switch${paused ? ' qqs-collect-paused' : ''}` },
+        h('div', { className: 'qqs-card-head' },
+          h('div', { className: 'qqs-card-title' },
+            h('span', { className: 'qqs-card-title-icon' }, h(Glyph, { name: 'inbox', size: 14 })),
+            '收集开关'),
+          h('span', {
+            className: `qqs-dot ${paused ? 'qqs-dot-err' : 'qqs-dot-ok'}`,
+            title: paused ? '已暂停' : '正在收集',
+          })),
+        h('div', { className: 'qqs-collect-state' },
+          h('span', { className: 'qqs-collect-badge ' + (paused ? 'qqs-is-paused' : 'qqs-is-running') },
+            paused ? '已暂停' : '收集中'),
+          h('span', { className: 'qqs-muted' },
+            paused ? '群友发图不会入库' : '群友发的表情会自动收进库')),
+        h('div', { className: 'qqs-collect-btnrow' },
+          h(Button, {
+            variant: paused ? 'primary' : 'danger',
+            size: 'lg',
+            busy: saving,
+            disabled,
+            icon: paused ? 'inbox' : 'broom',
+            onClick: () => {
+              if (disabled) return
+              write('collect.enabled', next, next ? '恢复收集' : '暂停收集')
+              onToast?.(next ? 'ok' : 'warn', next ? '已恢复收集，群友发图会重新入库' : '已暂停收集')
+            },
+          }, paused ? '恢复收集' : '暂停收集')),
+        paused
+          ? h('div', { className: 'qqs-collect-note' },
+            h(Glyph, { name: 'alert', size: 13 }),
+            h('span', null, '当前已暂停自动收集，群友发图仅供聊天识别，不入库。'))
+          : null,
+        disabled
+          ? h('div', { className: 'qqs-card-desc' }, '设置服务不可用，开关暂时只读。')
+          : null)
+    }
+
+    function StatusTab({ data, form, onGoto, onOpenError, onToast }) {      if (!data) return h(Empty, { title: '还没有数据', desc: '等第一次状态轮询完成；如果一直停在加载中，看顶部错误提示。' })
 
       const library = data.library ?? {}
       const limits = data.limits ?? {}
@@ -2375,6 +2455,8 @@ window.__ModuleLoader__.load({
       const collectEnabled = collect.enabled === true
 
       return h('div', { className: 'qqs-pane' },
+        // ⚠️ 收集总闸放最顶上：用户要能"随时一键停"，不该往设置页里翻。
+        h(CollectSwitch, { data, form, onToast }),
         h('div', { className: 'qqs-grid' },
           h(StatCard, {
             label: '库里的表情',
@@ -3358,7 +3440,7 @@ window.__ModuleLoader__.load({
           : null,
 
         tab === 'status'
-          ? h(StatusTab, { data, onGoto: setTab, onOpenError: (message) => pushToast('err', message) })
+          ? h(StatusTab, { data, form, onGoto: setTab, onOpenError: (message) => pushToast('err', message), onToast: pushToast })
           : tab === 'actions'
             ? h(ActionsTab, {
               data,

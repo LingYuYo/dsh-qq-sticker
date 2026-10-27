@@ -125,6 +125,21 @@ export class Ingestor {
   }
 
   /**
+   * 收图总闸（**所有入库路径的唯一入口检查**）。
+   *
+   * 2026-10-27：用户要求「随时一键暂停收集」——暂停时必须 0 资源消耗：
+   * 不下载、不写盘、不触发打标，连附件都不读。
+   *
+   * @returns {{ok:boolean, reason?:string}}
+   */
+  collectGate() {
+    const cfg = this.getConfig()
+    if (!cfg?.enabled) return { ok: false, reason: 'plugin-disabled' }
+    if (!cfg?.collect?.enabled) return { ok: false, reason: 'collect-paused' }
+    return { ok: true }
+  }
+
+  /**
    * 实时收：从一条 `user/message` 的 content 里挑 image 块入库。
    *
    * @param {object} opts
@@ -135,8 +150,10 @@ export class Ingestor {
    * @returns {{queued:number, skipped:string[]}}
    */
   onUserMessage({ sessionId, content, srcHint = '', chatKey = '' }) {
+    // ⚠️ 第一件事就是过总闸：暂停时后面一行都不该执行（不解析、不入队、不读图）。
+    const gate = this.collectGate()
+    if (!gate.ok) return { queued: 0, skipped: [gate.reason] }
     const cfg = this.getConfig()
-    if (!cfg.enabled || !cfg.collect.enabled) return { queued: 0, skipped: ['disabled'] }
     const blocks = Array.isArray(content) ? content : []
     const images = blocks.filter((block) => block && block.type === 'image' && block.attachment)
     if (images.length === 0) return { queued: 0, skipped: ['no-image'] }
@@ -222,6 +239,10 @@ export class Ingestor {
 
   /** 真正下载 + 入库。 */
   async _ingestOne(job) {
+    // 暂停发生在「已入队、还没下载」之间时，这里必须立刻放弃 ——
+    // 否则用户点了暂停，后台还在安静地下载写盘，等于没停。
+    const gate = this.collectGate()
+    if (!gate.ok) return
     const cfg = this.getConfig()
     if (this.hourlyLeft() <= 0) return
     const readImage = this.deps.readImage
@@ -262,11 +283,17 @@ export class Ingestor {
     }
   }
 
-  /** 清空未处理队列（插件卸载时用）。 */
+  /** 清空未处理队列（插件卸载 / 暂停收集时用）。 */
   dispose() {
     this._queue.length = 0
     this._recentKeys.clear()
     this._failedKeys.clear()
+  }
+
+  /** 暂停收集：立刻清空还没处理的队列（已入队的也不收了）。 */
+  pause() {
+    this._queue.length = 0
+    return this.snapshot()
   }
 
   /** 排障：队列长度。 */

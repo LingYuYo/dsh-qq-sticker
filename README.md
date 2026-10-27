@@ -57,10 +57,10 @@ dsh-qq-sticker/
     backup.js           # v2：定时备份 + 保留 N 份 + 调度
   locale/{zh,en}.json   # 插件列表里的标题/描述
   icon.svg
-  test-offline.mjs        # 78 条：纯逻辑
-  test-integration.mjs    # 17 条：假 ctx 跑装配与事件流
-  test-panel-client.mjs   # 76 条：面板槽位 / 三 Tab / 设置页（卡片·层级·下拉·路径）/ 数据通路 / 红线
-  test-panel-host.mjs     # 39 条：jobs / actions / 路由 / state 字段
+  test-offline.mjs        # 81 条：纯逻辑
+  test-integration.mjs    # 18 条：假 ctx 跑装配与事件流
+  test-panel-client.mjs   # 81 条：面板槽位 / 三 Tab / 收集总闸 / 设置页 / 数据通路 / 红线
+  test-panel-host.mjs     # 40 条：jobs / actions / 路由 / state 字段
   test-panel-e2e.mjs      # 20 条：真实路由的 HTTP 状态码与响应体
   test-contract.mjs       # 9 条：client 字段 ↔ Host 返回的一致性
   test-store.mjs          # 11 条：存储目录解析 / 搬迁 / 路径归一化
@@ -84,7 +84,7 @@ dsh-qq-sticker/
 
 | Tab | 内容 |
 |---|---|
-| **概览** | 总张数 / 占用容量 / 今日发送 / 下次自动收集；容量条、打标组成、视觉通道与收图队列状态、主动发图与斗图与备份状态、数据目录、已注册的模型工具 |
+| **概览** | 顶部**收集总闸**（暂停 / 恢复收集）；总张数 / 占用容量 / 今日发送 / 下次自动收集；容量条、打标组成、视觉通道与收图队列状态、主动发图与斗图与备份状态、数据目录、已注册的模型工具 |
 | **操作** | 确认应用本地整理（把资源管理器里手动挪的图同步回库）、一键整理打标、清理无意义图、立即收集、删除最早的图、生成报表、立即备份；清空库在危险区（需键入 `CLEAR` 二次确认）。长任务走异步 job，面板里有进度条与耗时 |
 | **设置** | 七张独立卡片（发送 / 收集 / 视觉 / 主动发图 / 斗图与连发 / 定时备份 / 高级）：标题左侧彩色装饰条、整行可点击折叠、右侧 v/^ 箭头；卡内按父子分组缩进（如「斗图与连发」拆成跟队形 / 连发 / 团战）。每类只露最常用的 1~4 项，其余点开才展开 |
 
@@ -101,6 +101,28 @@ dsh-qq-sticker/
 ---
 
 ## v2 高级功能
+
+### 一键暂停收集
+
+概览页顶部就是总闸，不用往设置页里翻：
+
+- **收集中** → 绿灯，按钮是「暂停收集」；
+- **已暂停** → 红灯，按钮是「恢复收集」，并显示一句「当前已暂停自动收集，群友发图仅供聊天识别，不入库。」
+
+写的是 `collect.enabled`（与设置页「自动收集」同一个字段，两边互通，热生效）。
+
+暂停是**真停**，不是"少收一点"：
+
+| 环节 | 暂停时的行为 |
+|---|---|
+| `session/event` 收图 | 第一行就 `collectGate()` 返回，不解析 content、不挂原始图 token |
+| `Ingestor.onUserMessage` | `{queued:0, skipped:['collect-paused']}`，不入队 |
+| 已入队但还没下载的 | `_ingestOne` 再查一次闸，直接放弃；`pause()` 还会立刻清空队列 |
+| 下载 / 写盘 / 打标 | 全都不发生（测试断言：`readImage` 0 次、`library.ingest` 0 次） |
+| 定时收集 | `maybeRun()` 直接返回 `skipped:'disabled'` |
+| 手动「立即收集」/ 回扫 | `collectTopUsed()` / `scanSession()` 返回「收集已暂停」，不下载 |
+
+一句话：暂停时不读图、不写盘、不花 token。
 
 ### 自定义存储目录
 
@@ -363,9 +385,9 @@ HTTP 路由（面板与外部脚本共用）：
 node test-load.mjs                 # 装载自检：模拟 DSH 的 import → Config → apply(ctx)
 node test-load.mjs --real-cordis   # ★ 用真 Cordis 装载（能复现真机的 proxy 陷阱错误）
 node test-cordis-regression.mjs    # 回归：Cordis「未声明服务属性」陷阱焊死
-node test-offline.mjs              # 78 条：库/闸/评分/解析/工具定义
+node test-offline.mjs              # 81 条：库/闸/评分/解析/工具定义
 node test-integration.mjs          # 18 条：假 ctx 跑装配、agent/created、收图、发送、落盘
-node test-panel-client.mjs         # 77 条：面板槽位 / 三 Tab / 设置页 / 路径管理 / 数据通路 / CSS 红线
+node test-panel-client.mjs         # 81 条：面板槽位 / 三 Tab / 设置页 / 路径管理 / 数据通路 / CSS 红线
 node test-panel-host.mjs           # 40 条：Host 侧 jobs / actions / 路由 / state 字段
 node test-tree.mjs                 # 36 条：物理目录 / 待确认 / 发送范围 / 文件名映射 / 禁删回归
 node test-panel-e2e.mjs            # 20 条：真实路由跑一遍，验 HTTP 状态码与响应体
