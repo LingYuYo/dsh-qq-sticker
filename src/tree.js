@@ -96,8 +96,7 @@ export function sanitizeTagName(raw) {
 
 /** 文件名去掉扩展名后的 token（`沙雕_1d5f_生气` → ['沙雕','1d5f','生气']）。 */
 function tokensOfName(name) {
-  return path.basename(String(name ?? ''))
-    .replace(/\.[a-z0-9]+$/i, '')
+  return stripCopySuffix(path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, ''))
     .split(/_+/)
     .map((token) => token.trim())
     .filter(Boolean)
@@ -130,7 +129,10 @@ export function hashInName(name) {
  * @returns {string} 标签名，或 '' 表示还没指定
  */
 export function pendingTagFromName(name) {
-  const tokens = tokensOfName(name)
+  // 整名先剥副本尾巴再切片：`震惊 (2)_1d5f.jpg` 剥完是 `震惊_1d5f`，
+  // 不先剥的话最后一个词会变成「震惊 (2)」，建出带括号的目录。
+  const base = stripCopySuffix(path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, ''))
+  const tokens = base.split(/_+/).map((token) => stripCopySuffix(token)).filter(Boolean)
   const words = tokens.filter((token) => !HASH_TOKEN_RE.test(token))
   if (words.length === 0) return ''
   const tag = words[words.length - 1]
@@ -245,6 +247,33 @@ export function isSendable(item, config) {
   return true
 }
 
+/**
+ * 去掉 Windows 重名文件的尾巴。
+ *
+ * 同一张图在资源管理器里再存一份，系统会自动加后缀：
+ *   `震惊.jpg` → `震惊 (2).jpg`、`震惊(3).jpg`、`震惊（4）.jpg`（中文输入法的全角括号）
+ *   `震惊.jpg` → `震惊 - 副本.jpg`
+ *
+ * ⚠️ 这些尾巴必须剥掉再解析标签，否则 `震惊 (2)` 会变成一个叫「震惊 (2)」的标签、
+ * 建出一个叫「震惊 (2)」的目录 —— 用户放两张同名图就得到两个目录。
+ *
+ * 只剥**结尾**的副本标记；`副本` 必须带分隔符（` - ` / ` — ` / `_`）才算，
+ * 免得把真叫「副本」的标签吃掉。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripCopySuffix(text) {
+  let out = String(text ?? '').trim()
+  // 连剥几次：`震惊 (2) (3).jpg` 这类叠了两层的也要干净
+  for (let round = 0; round < 5; round++) {
+    const next = out.replace(/(?:\s*[（(]\d{1,3}[)）]|\s*[-—_]\s*副本)\s*$/u, '').trim()
+    if (next === out) break
+    out = next
+  }
+  return out
+}
+
 /** 是不是我们命名的图片文件（**只用于识别命名格式，绝不能用来决定删不删**）。 */
 export function isOurFileName(name) {
   const base = path.basename(String(name ?? ''))
@@ -259,6 +288,9 @@ export function isOurFileName(name) {
  *   `开心_1d5f.jpg`       → 开心      （第一个下划线前的词）
  *   `开心_随便打的字.jpg`  → 开心
  *   `开心_1d5f_未识别.jpg` → 开心      （只看第一段）
+ *   `震惊 (2).jpg`        → 震惊      （Windows 重名尾巴先剥掉）
+ *   `震惊（2）.jpg`       → 震惊      （全角括号同样处理）
+ *   `震惊 - 副本.jpg`     → 震惊
  *   `未识别_1d5f.jpg`     → ''        （未识别占位名，不产生标签）
  *   `a1b2c3d4.jpg`        → ''        （纯哈希/乱码，当未识别）
  *
@@ -266,7 +298,7 @@ export function isOurFileName(name) {
  * @returns {string} 标签名，或 '' 表示没有标签（当未识别）
  */
 export function rootTagFromName(name) {
-  const base = path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, '')
+  const base = stripCopySuffix(path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, ''))
   const first = base.split('_')[0].trim()
   if (!first) return ''
   // 占位名 / 纯哈希 → 没有标签

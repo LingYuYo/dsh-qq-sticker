@@ -15,7 +15,7 @@
  * 跑法：`node test-tree.mjs`
  */
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -23,7 +23,7 @@ import { Library } from './src/library.js'
 import { createJobs } from './src/jobs.js'
 import { createActions } from './src/actions.js'
 import { DEFAULTS, readConfig } from './src/config.js'
-import { isSendable, migrateLayout, rootTagFromName, walkImageFiles } from './src/tree.js'
+import { isSendable, migrateLayout, pendingTagFromName, rootTagFromName, walkImageFiles } from './src/tree.js'
 import { buildTools, TOOL_PREFIX } from './src/tools.js'
 import { shortId } from './src/library.js'
 
@@ -632,6 +632,99 @@ await check('rootTagFromName：解析各种写法的第一个词', async () => {
   for (const [name, want] of cases) {
     assert.equal(rootTagFromName(name), want, `${name} 应解析成 "${want}"`)
   }
+})
+
+await check('rootTagFromName：Windows 重名尾巴 (2)/(3)/全角/副本 都剥掉', async () => {
+  const cases = [
+    ['震惊 (2).jpg', '震惊'],
+    ['震惊(2).jpg', '震惊'],
+    ['震惊（2）.jpg', '震惊'],          // 全角括号（中文输入法）
+    ['震惊 (12).jpg', '震惊'],
+    ['震惊 (2) (3).jpg', '震惊'],       // 叠了两层
+    ['震惊 - 副本.jpg', '震惊'],
+    ['震惊—副本.png', '震惊'],
+    ['震惊_1d5f (2).jpg', '震惊'],      // 哈希 + 副本尾巴同时存在
+    ['难过 (10).gif', '难过'],
+  ]
+  for (const [name, want] of cases) {
+    assert.equal(rootTagFromName(name), want, `${name} 应解析成 "${want}"`)
+  }
+  // 不能把真叫「副本」的标签吃掉
+  assert.equal(rootTagFromName('副本.jpg'), '副本')
+  assert.equal(rootTagFromName('震惊副本.jpg'), '震惊副本', '没有分隔符的「副本」不算副本尾巴')
+})
+
+await check('震惊.jpg + 震惊 (2).jpg：两张都进同一个 已识别/震惊/ 目录', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    await mkdir(imagesDir, { recursive: true })
+    // 内容不同 → 哈希不同，不会被内容去重
+    await writeFile(path.join(imagesDir, '震惊.jpg'), makePng(10, 10, 51))
+    await writeFile(path.join(imagesDir, '震惊 (2).jpg'), makePng(10, 10, 52))
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 0, '一张都不许删')
+
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 2, `两张都该还在，实际 ${after.length}`)
+
+    const inShock = after.filter((file) => file.rel.startsWith('已识别/震惊/'))
+    assert.equal(inShock.length, 2, `两张都应在 已识别/震惊/ 下，实际 ${inShock.map((f) => f.rel).join(',')}`)
+    for (const file of inShock) {
+      assert.match(file.rel, /^已识别\/震惊\/震惊_[0-9a-f]{4}\.jpg$/, `命名要规范，实际 ${file.rel}`)
+    }
+    // 绝不能因为 "(2)" 建出第二个目录（待确认分类 是常驻目录，不算标签）
+    const tagDirs = (await readdir(path.join(imagesDir, '已识别'))).filter((name) => name !== '待确认分类')
+    assert.deepEqual(tagDirs, ['震惊'], `只该有一个标签目录，实际 ${tagDirs.join(',')}`)
+
+    assert.equal(library.items.length, 2, '两张都要登记进库')
+    for (const item of library.items) assert.deepEqual(item.tags, ['震惊'])
+    assert.equal(library.visible().length, 2, '两张都能发')
+  })
+})
+
+await check('解析不出来的重名文件：留在根目录并标未识别，绝不删', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    await mkdir(imagesDir, { recursive: true })
+    // 纯哈希 + 副本尾巴：剥完还是纯哈希 → 没有标签 → 该留在根目录当未识别
+    await writeFile(path.join(imagesDir, 'a1b2c3d4e5f6 (2).jpg'), makePng(10, 10, 61))
+    await writeFile(path.join(imagesDir, '(2).jpg'), makePng(10, 10, 62))
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 0, '解析不出来也不许删')
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 2, `两张都该还在，实际 ${after.length}`)
+    const root = after.filter((file) => !file.rel.includes('/'))
+    assert.equal(root.length, 2, `都应留在根目录，实际 ${root.map((f) => f.rel).join(',')}`)
+    for (const file of root) {
+      assert.match(file.rel, /^未识别_[0-9a-f]{4}\.jpg$/, `应改名为 未识别_<哈希>.jpg，实际 ${file.rel}`)
+    }
+    assert.equal(library.items.length, 2)
+    for (const item of library.items) {
+      assert.deepEqual(item.tags, [], '没有标签')
+      assert.equal(item.pending, true, '标为待确认/未识别')
+    }
+    assert.equal(library.visible().length, 0, '未识别的不许发')
+  })
+})
+
+await check('待确认分类里的重名尾巴也剥掉：待确认分类/震惊 (2).jpg → 震惊', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 63) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `已识别/待确认分类/震惊 (2)_${hash}.jpg`)
+
+    await sync(runtime)
+    const tag = pendingTagFromName(`震惊 (2)_${hash}.jpg`)
+    assert.equal(tag, '震惊', `应剥掉 (2)，实际 "${tag}"`)
+    assert.equal(item.file.startsWith('已识别/震惊/'), true, `实际 ${item.file}`)
+  })
 })
 
 await check('根目录 开心.jpg（无哈希）→ 按标签归类并强制改名为 开心_<哈希>.jpg', async () => {
