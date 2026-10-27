@@ -271,9 +271,10 @@ await check('clear：confirm="CLEAR" 才真的清空（逐条删 + prune + flush
   )
   assert.equal(lib.items.length, 0, '库应清空')
   assert.equal(done.progress.total, 3, 'progress.total 应是清空前的条数')
-  const { readdir } = await import('node:fs/promises')
-  const images = await readdir(path.join(dir, 'images'))
-  assert.deepEqual(images, [], `images/ 目录应清空，实际还有 ${images.join(',')}`)
+  // 分类目录本身会保留（空目录是正常的），断言的是「没有图片文件残留」
+  const { walkImageFiles } = await import('./src/tree.js')
+  const images = await walkImageFiles(path.join(dir, 'images'))
+  assert.deepEqual(images.map((file) => file.rel), [], `images/ 下不应再有图片，实际还有 ${images.map((file) => file.rel).join(',')}`)
 })
 
 await check('cleanup：默认 dryRun=true（只报告，不动库）', async () => {
@@ -299,6 +300,27 @@ await check('cleanup：默认 dryRun=true（只报告，不动库）', async () 
   assert.equal(done.progress.total, before, 'cleanup 的 progress.total = 库条目数')
   assert.ok(done.progress.done > 0, 'cleanup 要逐条报进度')
   void shortId
+})
+
+await check('cleanup：标签是「无意义」但 tagFails 没达阈值也要算（真机 71 张却报 0 的回归）', async () => {
+  const { runtime, lib } = await makeRuntime()
+  const first = await lib.ingest({ bytes: makePng(24, 24, 61) })
+  const second = await lib.ingest({ bytes: makePng(24, 24, 62) })
+  // 一张来自「收录识图」：tagFails 还是 0；一张来自「整理」第一次：tagFails=1
+  lib.annotate(first.item, { tags: ['无意义'] })
+  lib.annotate(second.item, { tags: ['无意义'] })
+  second.item.tagFails = 1
+  lib.touch()
+  // 等异步改名落定，避免 cleanup 的 fileStat 读到旧路径
+  await lib.flush()
+
+  runtime.actions.run('cleanup', {})
+  const done = await waitJob(runtime, 'cleanup')
+  assert.equal(done.status, 'done')
+  assert.equal(done.result.dryRun, true)
+  assert.equal(done.result.meaningless, 2, `两张「无意义」都该被识别，实际 ${done.result.meaningless}`)
+  assert.ok(done.result.detail.includes('要删的是这些'), '试运行应列出会删的编号')
+  assert.equal(lib.items.length, 2, '试运行不能删')
 })
 
 await check('cleanup：dryRun=false 才真删，并在 result.after 反映新条数', async () => {

@@ -760,7 +760,7 @@ export async function buildTools(runtime) {
   // ── 清理 ───────────────────────────────────────────────────────────────
   defs.push(await defineStickerTool({
     name: TOOL.CLEANUP,
-    description: '清理表情库：① 删掉图片内容完全一样的重复份；② 删掉被标为「无意义」且累计达标的图；'
+    description: '清理表情库：① 删掉图片内容完全一样的重复份；② 删掉所有被标为「无意义」的图（与状态卡统计同口径）；'
       + '③ 清掉永久剔除名单里的图；④ 清掉索引里文件已丢失的条目。'
       + '当群友说「清理一下表情库」「把没用的表情删掉」时用它。⚠️ **默认是试运行**（只报告不删），'
       + '确认后要再调一次并传 dryRun=false 才会真删。不会删「还没整理过、暂时没标签」的图。',
@@ -796,7 +796,6 @@ export async function buildTools(runtime) {
       const dryRun = args?.dryRun !== false
       const blocked = new Set(cfg.library.blockedIds)
       const hiddenIds = new Set(cfg.library.hiddenIds)
-      const maxAttempts = cfg.vision.organizeMaxAttempts
 
       // ① 重复：索引按 sha1 建键，理论上不会有；这里防手改/迁移残留
       const bySrc = new Map()
@@ -811,9 +810,10 @@ export async function buildTools(runtime) {
         bySrc.set(item.src, keep)
         duplicates.push(drop)
       }
-      // ② 无意义且达标
-      const meaningless = library.items.filter((item) => item.tags.includes('无意义')
-        && num(item.tagFails, 0) >= maxAttempts)
+      // ② 无意义：按标签判定（与状态卡/报表同口径）。
+      //    阈值只管「整理时自动删」，人工清理不该被卡住 —— 以前 71 张无意义
+      //    因为 tagFails 只有 0/1 而永远报 0 张，就是这个口径漂了。
+      const meaningless = library.items.filter((item) => item.tags.includes('无意义'))
       // ③ 剔除名单
       const blockedItems = library.items.filter((item) => {
         const sid = shortId(item)

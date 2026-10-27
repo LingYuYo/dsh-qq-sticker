@@ -10,8 +10,11 @@
  * 这里只多做两件事：① 分页调 `vision.recognizeBatch` 并报进度；② 把结果整理成
  * 契约 §4 里的 result 形状。业务判定一行都没改。
  */
-import { num } from './util.js'
+import { num, safeService } from './util.js'
 import { shortId } from './library.js'
+import { stringOfList } from './config.js'
+import { tagVocabulary } from './tagging.js'
+import { analyzeTree, applyTreePlan } from './tree.js'
 
 /** 一次整理最多看几张（与 tools.js 的 60 上限一致）。 */
 const ORGANIZE_MAX = 60
@@ -30,6 +33,8 @@ const KINDS = [
   { kind: 'clear', label: '清空库', args: 'confirm: "CLEAR"（必须）' },
   // v2
   { kind: 'backup', label: '立即备份', args: '无' },
+  // v2.2：物理文件夹 ↔ 数据库 人工协作
+  { kind: 'sync_tree', label: '确认应用本地整理', args: 'dryRun（默认 false）' },
 ]
 
 /**
@@ -38,6 +43,33 @@ const KINDS = [
  */
 function badRequest(message) {
   return Object.assign(new Error(message), { statusCode: 400 })
+}
+
+/**
+ * 把同步时新发现的标签目录写进配置的词表（vision.customTags）。
+ *
+ * 为什么必须写配置：`tagVocabulary()` 只认 tagCategories / customTags / 内置词，
+ * 不写进去的话下次打标模型根本看不到这个新标签，用户建了目录也白建。
+ * settings 服务不可用时只返回 false —— 标签本身已经落到条目上、也进了
+ * library.extraTags，不会丢。
+ *
+ * @returns {Promise<boolean>}
+ */
+async function rememberTags(runtime, cfg, tags) {
+  const settings = safeService(runtime.ctx, 'settings')
+  if (!settings || typeof settings.update !== 'function') return false
+  const existing = stringOfList(cfg?.vision?.customTags)
+  const merged = [...new Set([...existing, ...tags.map((tag) => String(tag).trim()).filter(Boolean)])]
+  if (merged.length === existing.length) return true
+  try {
+    await settings.update('qq-sticker', {
+      vision: { ...cfg.vision, customTags: merged.join(',') },
+    })
+    return true
+  } catch (error) {
+    runtime.log?.('warn', `新标签写配置失败（标签仍在库里）：${error?.message ?? error}`)
+    return false
+  }
 }
 
 /** 轻量文件存在检查（cleanup 用；与 tools.js 的 fileStat 保持同步）。 */
@@ -152,7 +184,6 @@ export function createActions({ runtime, jobs, log } = {}) {
         // 以下四类判定与 tools.js CLEANUP 逐行一致
         const blocked = new Set(cfg.library.blockedIds)
         const hiddenIds = new Set(cfg.library.hiddenIds)
-        const maxAttempts = cfg.vision.organizeMaxAttempts
         const items = [...lib.items]
         const total = items.length
 
@@ -169,9 +200,13 @@ export function createActions({ runtime, jobs, log } = {}) {
           bySrc.set(item.src, keep)
           duplicates.push(drop)
         }
-        // ② 无意义且达标
-        const meaningless = items.filter((item) => item.tags.includes('无意义')
-          && num(item.tagFails, 0) >= maxAttempts)
+        // ② 无意义：**按标签判定**，与状态卡/报表的统计口径保持一致。
+        //
+        //    以前这里还要求 tagFails >= organizeMaxAttempts，结果真机 71 张
+        //    「无意义」的图 tagFails 最多只有 1（收录识图那条路压根不累计，
+        //    而已经打上标签的图又永远不会再进「整理」候选），试运行永远报 0 张。
+        //    人工点「清理」本来就是明确动作，阈值只该管整理时的自动删除。
+        const meaningless = items.filter((item) => item.tags.includes('无意义'))
         // ③ 剔除名单
         const blockedItems = items.filter((item) => {
           const sid = shortId(item)
@@ -348,6 +383,85 @@ export function createActions({ runtime, jobs, log } = {}) {
           removed: Array.isArray(result.removed) ? result.removed.length : 0,
           freedMB: Number((num(result.bytes, 0) / 1048576).toFixed(2)),
           errors: Array.isArray(result.errors) ? result.errors.slice(0, 5) : [],
+        }
+      },
+    },
+
+    // ── 确认应用本地整理（物理文件夹 → 数据库）──────────────────────────
+    //
+    // 用户直接在资源管理器里挪图：无意义/ → 已识别/哈基米/，或者丢进 待删除/。
+    // 这个动作扫描目录树，把用户的意图写回库：
+    //   · 已识别/<标签> → 标签改成该目录名（人工修正留痕）
+    //   · 无意义/       → 标签改成「无意义」
+    //   · 未识别/       → 清空标签
+    //   · 待删除/       → 物理删文件 + 删条目
+    //   · 新建的标签目录 → 登记进标签词表
+    sync_tree: {
+      label: '确认应用本地整理',
+      normalize(args) {
+        return { dryRun: argsOf(args).dryRun === true }
+      },
+      async run({ dryRun }, progress) {
+        const cfg = getConfig()
+        const lib = library()
+        await lib.load()
+
+        // 「新标签」判定：配置里的词表 + 库里已用过的标签 + 之前登记过的
+        const knownTags = new Set(tagVocabulary(cfg))
+        for (const tag of lib.extraTags ?? []) knownTags.add(tag)
+        for (const item of lib.items) {
+          for (const tag of item.tags ?? []) knownTags.add(String(tag))
+        }
+
+        progress(0, 0, '正在扫描图片目录…')
+        const plan = await analyzeTree({
+          imagesDir: lib.imagesDir,
+          items: lib.items,
+          knownTags,
+        })
+        const total = plan.changes.length + plan.deletes.length
+        progress(0, total, total > 0 ? `准备同步 0/${total} 项` : '目录和库里一致')
+
+        const result = await applyTreePlan(plan, {
+          library: lib,
+          imagesDir: lib.imagesDir,
+          dryRun,
+        })
+        progress(total, total, dryRun ? '试运行完成（未改动）' : '同步完成')
+
+        // 新标签写进配置词表：以后打标时模型也能选到它
+        let tagsSaved = false
+        if (!dryRun && result.newTags.length > 0) {
+          tagsSaved = await rememberTags(runtime, cfg, result.newTags)
+        }
+        await lib.flush()
+
+        const parts = []
+        if (result.retagged > 0) parts.push(`改标签 ${result.retagged} 张`)
+        if (result.deleted > 0) parts.push(`物理删除 ${result.deleted} 张`)
+        if (result.moved > 0) parts.push(`换位置 ${result.moved} 张`)
+        if (result.newTags.length > 0) parts.push(`新标签 ${result.newTags.join('、')}`)
+        if (result.unknown > 0) parts.push(`${result.unknown} 个文件没对上库（未动）`)
+        const detail = dryRun
+          ? (parts.length > 0 ? `试运行：${parts.join('，')}。确认后关掉试运行再点一次才会真的改。` : '试运行：目录和库里一致，没有要改的。')
+          : (parts.length > 0 ? `${parts.join('，')}。` : '目录和库里一致，没有要改的。')
+        return {
+          dryRun,
+          scanned: result.scanned,
+          matched: result.matched,
+          unchanged: result.unchanged,
+          deleted: result.deleted,
+          retagged: result.retagged,
+          moved: result.moved,
+          adopted: result.adopted,
+          unknown: result.unknown,
+          duplicates: result.duplicates,
+          newTags: result.newTags,
+          tagsSaved,
+          corrections: result.corrections.slice(0, 10),
+          errors: result.errors.slice(0, 10),
+          after: lib.items.length,
+          detail,
         }
       },
     },

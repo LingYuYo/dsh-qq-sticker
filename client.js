@@ -330,7 +330,7 @@ window.__ModuleLoader__.load({
         kind: 'cleanup',
         icon: 'broom',
         title: '清理无意义图',
-        desc: '删重复份、删累计判「无意义」的图、剔除黑名单、清掉文件已丢失的条目。默认先试运行，看清了再真删。',
+        desc: '删重复份、删所有被标「无意义」的图（与状态卡统计同口径）、剔除黑名单、清掉文件已丢失的条目。默认先试运行，看清了再真删。',
         primary: '试运行',
         danger: false,
         dryRun: true,
@@ -2614,6 +2614,28 @@ window.__ModuleLoader__.load({
         if (result.stopReason) lines.push(String(result.stopReason))
         return lines
       }
+      if (kind === 'sync_tree') {
+        const lines = [
+          `扫描 ${result.scanned ?? 0} 个文件：改标签 ${result.retagged ?? 0} 张、换位置 ${result.moved ?? 0} 张、物理删除 ${result.deleted ?? 0} 张`,
+        ]
+        if (Array.isArray(result.newTags) && result.newTags.length > 0) {
+          lines.push(`新标签目录：${result.newTags.join('、')}${result.tagsSaved === false ? '（已记进库；写配置词表失败，重启后可再同步一次）' : ''}`)
+        }
+        if (Array.isArray(result.corrections) && result.corrections.length > 0) {
+          for (const row of result.corrections.slice(0, 3)) {
+            lines.push(`· #${row.id}：${(row.from ?? []).join('/') || '未分类'} → ${(row.to ?? []).join('/')}`)
+          }
+          if (result.corrections.length > 3) lines.push(`（还有 ${result.corrections.length - 3} 条人工修正）`)
+        }
+        if (result.unknown) lines.push(`有 ${result.unknown} 个文件没对上库（没动它们，可在目录里核对）`)
+        if (result.duplicates) lines.push(`有 ${result.duplicates} 个重复文件（同一张图放了多份，没动）`)
+        if (Array.isArray(result.errors) && result.errors.length > 0) {
+          lines.push(`失败 ${result.errors.length} 项：${result.errors.slice(0, 2).join('；')}`)
+        }
+        if (result.dryRun) lines.push('这是试运行，库和文件都没改')
+        if (result.detail) lines.push(String(result.detail))
+        return lines
+      }
       if (kind === 'delete_oldest') {
         const lines = [`删除 ${result.deleted ?? 0} 张，库里还剩 ${result.kept ?? 0} 张`]
         if (result.freedMB) lines.push(`释放 ${result.freedMB} MB`)
@@ -2753,6 +2775,31 @@ window.__ModuleLoader__.load({
           h('div', { className: 'qqs-card-desc' },
             '直接跳到磁盘上看库里的图片文件。',
             data?.dataDir ? ['目录：', h('span', { className: 'qqs-code', title: data.dataDir }, data.dataDir)] : '')),
+
+        // ── 人机协作：用户在资源管理器里挪图，点这里把意图写回库 ────────
+        h('div', { className: 'qqs-card' },
+          h('div', { className: 'qqs-card-head' },
+            h('div', { className: 'qqs-card-title' },
+              h('span', { className: 'qqs-card-title-icon' }, h(Glyph, { name: 'folder', size: 14 })),
+              '确认应用本地整理')),
+          h('div', { className: 'qqs-card-desc' },
+            '图片已经按标签分好目录：已识别/<标签名>/、无意义/、待删除/、未识别/。',
+            '你可以直接在「打开本地文件夹」里手动挪图 —— 从 无意义/ 挪到 已识别/哈基米/，或者丢进 待删除/，',
+            '再点下面的按钮。插件会扫描目录：按文件夹改标签、记住这次人工修正、把 待删除/ 里的图彻底删掉；',
+            '新建的标签文件夹也会登记进标签词表。'),
+          h('div', { className: 'qqs-action-ctl' },
+            h(Button, {
+              variant: 'primary',
+              busy: busyKind === 'sync_tree',
+              disabled: latestJob(jobs, 'sync_tree')?.status === 'running',
+              style: { width: '100%' },
+              onClick: () => { void trigger('sync_tree', {}) },
+            }, latestJob(jobs, 'sync_tree')?.status === 'running' ? '正在扫描目录…' : '确认应用本地整理')),
+          latestJob(jobs, 'sync_tree')?.status === 'done' && latestJob(jobs, 'sync_tree')?.result
+            ? h('div', { className: 'qqs-card-desc', style: { marginTop: 6 } },
+              resultLines('sync_tree', latestJob(jobs, 'sync_tree').result)
+                .map((line, index) => h('div', { key: index }, line)))
+            : null),
 
         ACTIONS.map((action) => {
           const job = latestJob(jobs, action.kind)

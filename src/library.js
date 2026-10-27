@@ -4,7 +4,8 @@
  * 设计取舍（都来自原 sticker-steal 的实战结论）：
  *  · 主键 = 图片字节的 sha1（内容寻址）。同一张图从任何群收进来都只存一份，
  *    "按内容去重"比"按消息 id 去重"可靠（用户会把同一张图转发很多遍）。
- *  · 图片本体单独放 images/<sha1>.<ext>，索引只记相对文件名 —— 索引损坏时可以重建，
+ *  · 图片本体按物理分类放在 images/已识别/<标签>/、无意义/、未识别/、待删除/ 下，
+ *    文件名 <标签>_<哈希前4位>.<ext>；索引只记相对路径 —— 索引损坏时可以重建，
  *    图片不会跟着废掉。
  *  · 索引整份读写 + 防抖落盘：800 张规模下 ~300KB，够用；真要更大再换 sqlite。
  *  · 软删除用 hidden 集合，不删文件也不删条目 —— 模型误删可以恢复，
@@ -14,9 +15,13 @@ import path from 'node:path'
 
 import { MOOD_WORDS } from './config.js'
 import {
-  createSaver, fileInfo, listDir, num, oneLine, readJson, removeFile,
+  createSaver, fileInfo, num, oneLine, readJson, removeFile,
   sha1, sniffImage, todayKey, writeBytes, writeJsonAtomic,
 } from './util.js'
+import {
+  TREE_ROOT_NAMES, isOurFileName, placementRel, reconcilePaths,
+  relocateItemFile, toPosix, walkImageFiles,
+} from './tree.js'
 
 /** 索引结构版本。不兼容的旧结构直接重来（不猜着迁移）。 */
 const LIB_VERSION = 1
@@ -65,6 +70,11 @@ function emptyItem() {
     tagTriedAt: 0,
     viewedAt: 0,
     hidden: false,
+    // 人工修正留痕（「确认应用本地整理」按文件夹改的标签）：后续打标不能盖回去
+    manualTag: '',
+    manualTagFrom: [],
+    manualTagAt: 0,
+    manualEdits: 0,
   }
 }
 
@@ -72,13 +82,23 @@ function emptyItem() {
 function normalizeItem(raw, imagesDir) {
   if (!raw || typeof raw !== 'object') return null
   const src = String(raw.src ?? '').trim()
-  const file = String(raw.file ?? '').trim()
+  let file = toPosix(String(raw.file ?? '').trim()).replace(/^\.\/+/, '')
+  const rawPath = String(raw.path ?? '').trim()
+  // 老索引里 file 可能是绝对路径（旧版本手改过），能落到 images/ 里就转成相对路径
+  if (file && path.isAbsolute(file)) {
+    const rel = path.relative(imagesDir, file)
+    file = rel.startsWith('..') ? '' : toPosix(rel)
+  }
+  if (!file && rawPath) {
+    const rel = path.relative(imagesDir, rawPath)
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) file = toPosix(rel)
+  }
   if (!src && !file) return null
   const item = emptyItem()
   item.src = src
   item.file = file
   item.key = src ? `src:${src}` : `file:${file.toLowerCase()}`
-  item.path = file ? path.join(imagesDir, file) : String(raw.path ?? '')
+  item.path = file ? path.join(imagesDir, file) : rawPath
   item.bytes = Math.max(0, num(raw.bytes, 0))
   item.ext = String(raw.ext ?? '').slice(0, 8)
   item.animated = raw.animated === true
@@ -106,6 +126,10 @@ function normalizeItem(raw, imagesDir) {
   item.tagTriedAt = num(raw.tagTriedAt, 0)
   item.viewedAt = num(raw.viewedAt, 0)
   item.hidden = raw.hidden === true
+  item.manualTag = String(raw.manualTag ?? '').slice(0, 30)
+  item.manualTagFrom = Array.isArray(raw.manualTagFrom) ? raw.manualTagFrom.map(String).filter(Boolean).slice(0, 6) : []
+  item.manualTagAt = num(raw.manualTagAt, 0)
+  item.manualEdits = Math.max(0, num(raw.manualEdits, 0))
   return item
 }
 
@@ -164,6 +188,10 @@ export class Library {
     this.bornAt = Date.now()
     this._loaded = false
     this._byKey = new Map()
+    /** 用户手动建的标签目录（同步时登记；即使 settings 不可用也不丢）。 */
+    this.extraTags = []
+    /** 文件搬家是异步的：flush/saveNow 前必须等它们落定，否则索引会指向不存在的文件。 */
+    this._relocations = new Set()
     this._saver = createSaver(1500, () => this.saveNow())
     /** 运行期统计（不落盘，报表里只当参考） */
     this.counters = { collected: 0, duplicates: 0, skipped: 0, evicted: 0, failed: 0 }
@@ -183,6 +211,9 @@ export class Library {
         this.items.push(item)
       }
       this.bornAt = num(raw.bornAt, this.bornAt)
+      if (Array.isArray(raw.extraTags)) {
+        this.extraTags = [...new Set(raw.extraTags.map(String).map((tag) => tag.trim()).filter(Boolean))].slice(0, 200)
+      }
       if (raw.counters && typeof raw.counters === 'object') {
         for (const key of Object.keys(this.counters)) {
           this.counters[key] = Math.max(0, num(raw.counters[key], 0))
@@ -198,14 +229,24 @@ export class Library {
     for (const item of this.items) this._byKey.set(item.key, item)
   }
 
+  /** 等所有正在搬的文件都落定（失败也不抛，路径由 relocate 自己管）。 */
+  async _settleRelocations() {
+    while (this._relocations.size > 0) {
+      await Promise.allSettled([...this._relocations])
+    }
+  }
+
   /** 立即落盘（卸载/测试用）。 */
   async saveNow() {
     try {
+      // 先把异步 rename 等完：不然写进去的是新路径、磁盘上还是旧文件。
+      await this._settleRelocations()
       await writeJsonAtomic(this.indexFile, {
         version: LIB_VERSION,
         savedAt: new Date().toISOString(),
         bornAt: this.bornAt,
         items: this.items,
+        extraTags: this.extraTags,
         counters: this.counters,
       })
     } catch (error) {
@@ -219,6 +260,7 @@ export class Library {
   }
 
   async flush() {
+    await this._settleRelocations()
     await this._saver.flush()
   }
 
@@ -306,8 +348,21 @@ export class Library {
       return { ok: false, reason: verdict.reason }
     }
 
-    const file = `${src.slice(0, 16)}.${sniff.ext}`
-    const full = path.join(this.imagesDir, file)
+    // 新图先落 未识别/未识别_<哈希前4位>.<ext>；打上标签后 annotate 会自动搬进
+    // 已识别/<标签名>/ 并改名（哈希位撞车时自动加长）。
+    let file = placementRel('untagged', '', src.slice(0, 4), sniff.ext)
+    let full = path.join(this.imagesDir, file)
+    let hashLen = 4
+    while ((await fileInfo(full)).exists) {
+      hashLen++
+      if (hashLen > src.length) {
+        file = placementRel('untagged', '', src, sniff.ext).replace(/(\.[a-z0-9]+)$/i, `-${Date.now().toString(36)}$1`)
+        full = path.join(this.imagesDir, file)
+        break
+      }
+      file = placementRel('untagged', '', src.slice(0, hashLen), sniff.ext)
+      full = path.join(this.imagesDir, file)
+    }
     try {
       await writeBytes(full, bytes)
     } catch (error) {
@@ -398,6 +453,8 @@ export class Library {
     if (!item) return false
     const idx = this.items.indexOf(item)
     if (idx < 0) return false
+    // 别在 rename 半路把文件删了（否则 rename 会把文件又「救回来」）
+    await this._settleRelocations()
     this.items.splice(idx, 1)
     this._byKey.delete(item.key)
     if (item.path) await removeFile(item.path)
@@ -433,11 +490,21 @@ export class Library {
     this.touch()
   }
 
-  /** 写标签/备注/文字。tags 会做闭合词表对齐（子串命中即归到标准词）。 */
-  annotate(item, patch = {}) {
+  /**
+   * 写标签/备注/文字。
+   *
+   * 默认走闭合词表对齐（子串命中即归到标准词）。`alignedTags` 用于已经对齐好的
+   * 标签（打标结果 / 用户手动建的标签目录）—— 不能再被 normalizeTag 归成「其他」，
+   * 否则「哈基米」这种自定义分类会被吃掉。
+   */
+  annotate(item, patch = {}, { alignedTags = false, relocate = true } = {}) {
     if (!item) return null
     if (Array.isArray(patch.tags)) {
-      item.tags = [...new Set(patch.tags.map(String).map(normalizeTag).filter(Boolean))].slice(0, 6)
+      const tags = patch.tags.map(String).map((tag) => tag.trim()).filter(Boolean)
+      const normalized = alignedTags
+        ? tags.map((tag) => (tag.includes('无意义') ? '无意义' : tag.slice(0, 30)))
+        : tags.map(normalizeTag).filter(Boolean)
+      item.tags = [...new Set(normalized)].slice(0, 6)
     }
     if (patch.note !== undefined) item.note = String(patch.note ?? '').slice(0, 200)
     if (patch.text !== undefined) item.text = String(patch.text ?? '').slice(0, 80)
@@ -445,7 +512,38 @@ export class Library {
     item.tagTriedAt = Date.now()
     item.lastReward = num(item.lastReward, 0)
     this.touch()
+    // 标签变了 → 文件要跟着搬目录/改名（异步，flush/saveNow 会等它）
+    if (relocate) this._relocate(item)
     return item
+  }
+
+  /** 异步把条目文件搬到物理分类目录；失败只 warn，不拖垮打标。 */
+  _relocate(item) {
+    if (!item?.file && !item?.path) return null
+    let task
+    task = relocateItemFile(this.imagesDir, item)
+      .then((result) => {
+        if (result?.moved || result?.adopted) this.touch()
+        return result
+      })
+      .catch((error) => {
+        this.log('warn', `图片改名失败（${item.file || item.path}）：${error?.message ?? error}`)
+        return { moved: false, error }
+      })
+      .finally(() => { this._relocations.delete(task) })
+    this._relocations.add(task)
+    return task
+  }
+
+  /** 登记一个标签（同步时用户新建的标签目录）。 */
+  rememberTag(tag) {
+    const text = String(tag ?? '').trim().slice(0, 30)
+    if (!text) return false
+    if (this.extraTags.includes(text)) return false
+    this.extraTags.push(text)
+    this.extraTags = this.extraTags.slice(-200)
+    this.touch()
+    return true
   }
 
   /** 视觉识别失败一次：累计次数（用来判"无意义"是否达标）。 */
@@ -469,15 +567,48 @@ export class Library {
     return gone.length
   }
 
-  /** 清掉 images/ 里没有任何条目引用的文件（索引损坏后的收尾）。 */
+  /**
+   * 把旧版平铺在 images/ 根下的文件搬进分类目录，并顺手把「索引路径丢了但文件
+   * 还在树里」的条目认回来。
+   *
+   * ⚠️ 只搬**根目录平铺**的旧文件。已经在 已识别/ 无意义/ 未识别/ 待删除/ 里的
+   * 文件不碰 —— 那可能是用户手动挪的，要等「确认应用本地整理」来读它的意图。
+   *
+   * @returns {Promise<{adopted:number, moved:number}>}
+   */
+  async migrateTree() {
+    await this.load()
+    const adopted = await reconcilePaths(this.imagesDir, this.items)
+    let moved = 0
+    for (const item of [...this.items]) {
+      const rel = toPosix(item.file)
+      const top = rel.split('/')[0]
+      const underTree = rel.includes('/') && TREE_ROOT_NAMES.includes(top)
+      if (underTree) continue
+      try {
+        const result = await relocateItemFile(this.imagesDir, item)
+        if (result.moved) moved++
+      } catch (error) {
+        this.log('warn', `旧图搬进分类目录失败（${item.file}）：${error?.message ?? error}`)
+      }
+    }
+    if (adopted > 0 || moved > 0) {
+      this.touch()
+      this.log('info', `图片目录整理：找回 ${adopted} 条路径，搬入分类目录 ${moved} 张`)
+    }
+    return { adopted, moved }
+  }
+
+  /** 清掉分类目录里没有任何条目引用、且文件名是我们自己起的图片（索引损坏后的收尾）。 */
   async pruneOrphanFiles() {
-    const referenced = new Set(this.items.map((item) => item.file))
-    const files = await listDir(this.imagesDir)
+    const referenced = new Set(this.items.map((item) => toPosix(item.file)).filter(Boolean))
+    const files = await walkImageFiles(this.imagesDir)
     let removed = 0
     for (const file of files) {
-      if (referenced.has(file)) continue
-      if (!/\.(png|jpe?g|gif|webp)$/i.test(file)) continue
-      await removeFile(path.join(this.imagesDir, file))
+      if (referenced.has(file.rel)) continue
+      // 用户自己丢进来的图片不碰（只清 `<标签>_<hash>.<ext>` / 旧版哈希名）
+      if (!isOurFileName(file.name)) continue
+      await removeFile(file.abs)
       removed++
     }
     if (removed > 0) this.log('info', `清掉 ${removed} 个无人引用的图片文件`)

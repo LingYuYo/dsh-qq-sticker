@@ -16,6 +16,7 @@ import path from 'node:path'
 
 import { createZip } from './zip.js'
 import { FILES } from './library.js'
+import { walkImageFiles } from './tree.js'
 import { num, readJson, safeService, writeJsonAtomic } from './util.js'
 
 /** 备份计划文件名（相对 dataDir）。不含进备份内容里，避免自引用。 */
@@ -316,15 +317,17 @@ export class Backup {
         const entry = await this._entry(this.dataDir, name, name, errors)
         if (entry) entries.push(entry)
       }
-      // 图片：平铺在 images/ 下，文件名 <sha1>.<ext>，逐张读、单张失败就跳过。
-      let imageNames = []
+      // 图片：分类目录是嵌套的（已识别/<标签>/…），递归列、逐张读，单张失败只跳过。
+      let imageFiles = []
       try {
-        imageNames = await readdir(this.imagesDir)
+        // 先显式探一下根目录：目录不存在时 walk 会静默返回空，这里要留一条 warn 给排障。
+        await readdir(this.imagesDir)
+        imageFiles = await walkImageFiles(this.imagesDir, { includeImageDirs: true })
       } catch (error) {
         this.log('warn', `备份：图片目录不可读（${this.imagesDir}）：${error?.message ?? error}`)
       }
-      for (const name of imageNames.sort()) {
-        const entry = await this._entry(this.imagesDir, name, `images/${name}`, errors)
+      for (const file of imageFiles.sort((a, b) => a.rel.localeCompare(b.rel))) {
+        const entry = await this._entry(this.imagesDir, file.rel, `images/${file.rel}`, errors)
         if (entry) entries.push(entry)
       }
 

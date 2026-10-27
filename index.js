@@ -369,6 +369,8 @@ export function startLifecycle(ctx, runtime) {
           log('warn', `原始图池索引重建失败（不影响收图）：${error?.message ?? error}`)
         })
         await runtime.collector.loadSchedule()
+        // 旧版平铺的哈希文件搬进 已识别/ 无意义/ 未识别/ 待删除/（只搬根目录，不动用户手动挪过的）
+        await runtime.library.migrateTree()
         await runtime.library.pruneMissingFiles()
         runtime.library.config = runtime.getConfig()
         // backup 绑的是 dataDir，解析完要重建一次

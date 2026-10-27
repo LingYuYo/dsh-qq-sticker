@@ -731,6 +731,19 @@ await check('每张卡有描述与主按钮', async () => {
   assert.ok(descs[5].includes('zip'), '备份卡应说明会打成 zip')
 })
 
+await check('操作页有「确认应用本地整理」大按钮，点击 POST kind=sync_tree', async () => {
+  actionJobs.length = 0
+  const { tree } = await openTab('actions')
+  const button = findAll(tree, (node) => node.type === 'button' && textOf(node) === '确认应用本地整理')[0]
+  assert.ok(button, '操作页应有「确认应用本地整理」按钮')
+  assert.equal(button.props.style?.width, '100%', '按钮应占满整行（大按钮）')
+  await button.props.onClick()
+  await settle()
+  const hit = actionJobs.find((entry) => entry.kind === 'sync_tree')
+  assert.ok(hit, `应 POST sync_tree，实际：${JSON.stringify(actionJobs.map((e) => e.kind))}`)
+  assert.equal(hit.args.dryRun, undefined, '正式同步不该带 dryRun')
+})
+
 await check('整理/清理/删最早各有「试运行」开关，默认打开', async () => {
   const { tree } = await openTab('actions')
   const switches = findAll(tree, (node) => node.props?.role === 'switch' && node.props['aria-label'] === '试运行')

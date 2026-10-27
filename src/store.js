@@ -18,6 +18,7 @@
  * 注意 `backups/` 是备份产物，不算"用户数据"，判断空目录时忽略它。
  */
 import { copyFile, mkdir, readdir, stat } from 'node:fs/promises'
+import { walkImageFiles } from './tree.js'
 import path from 'node:path'
 
 import { FILES } from './library.js'
@@ -156,19 +157,17 @@ async function migrateInto(target, source, note) {
   await mkdir(targetImages, { recursive: true })
   let copied = 0
   let failed = 0
-  let files = []
-  try {
-    files = await readdir(sourceImages)
-  } catch {
-    return
-  }
-  for (const name of files) {
+  // 分类目录是嵌套的：递归列（含 已识别/<标签>/…），并按同样的相对路径重建。
+  const files = await walkImageFiles(sourceImages)
+  for (const file of files) {
+    const to = path.join(targetImages, file.rel)
     try {
-      await copyFile(path.join(sourceImages, name), path.join(targetImages, name))
+      await mkdir(path.dirname(to), { recursive: true })
+      await copyFile(file.abs, to)
       copied++
     } catch (error) {
       failed++
-      note('warn', `搬迁时拷贝 ${name} 失败：${error?.message ?? error}`)
+      note('warn', `搬迁时拷贝 ${file.rel} 失败：${error?.message ?? error}`)
     }
   }
   note('info', `搬迁图片 ${copied} 张${failed > 0 ? `，失败 ${failed} 张` : ''}（旧目录保留，确认无误后可手动删）`)

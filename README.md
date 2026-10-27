@@ -85,7 +85,7 @@ dsh-qq-sticker/
 | Tab | 内容 |
 |---|---|
 | **概览** | 总张数 / 占用容量 / 今日发送 / 下次自动收集；容量条、打标组成、视觉通道与收图队列状态、主动发图与斗图与备份状态、数据目录、已注册的模型工具 |
-| **操作** | 一键整理打标、清理无意义图、立即收集、删除最早的图、生成报表、立即备份；清空库在危险区（需键入 `CLEAR` 二次确认）。长任务走异步 job，面板里有进度条与耗时 |
+| **操作** | 确认应用本地整理（把资源管理器里手动挪的图同步回库）、一键整理打标、清理无意义图、立即收集、删除最早的图、生成报表、立即备份；清空库在危险区（需键入 `CLEAR` 二次确认）。长任务走异步 job，面板里有进度条与耗时 |
 | **设置** | 七张独立卡片（发送 / 收集 / 视觉 / 主动发图 / 斗图与连发 / 定时备份 / 高级）：标题左侧彩色装饰条、整行可点击折叠、右侧 v/^ 箭头；卡内按父子分组缩进（如「斗图与连发」拆成跟队形 / 连发 / 团战）。每类只露最常用的 1~4 项，其余点开才展开 |
 
 设置页的两个细节：
@@ -134,6 +134,33 @@ dsh-qq-sticker/
 | **团战模式** | 连续多张图刷屏时，用视觉模型看懂它们在表达什么，再从库里找相似图。**每次消耗一次多模态调用**，有 `teamBudgetPerDay` 硬额度，默认关闭 |
 
 队形检测只比较 `attachmentId`，**不下载图片**、零 IO 零 token。已知局限：同一张图被重新上传会拿到新 id，识别不了。
+
+### 物理文件夹整理（人机协作）
+
+图片不再平铺成一堆哈希，`images/` 直接按标签分目录：
+
+```
+images/已识别/哈基米/哈基米_a1b2.jpg
+images/无意义/无意义_c3d4.jpg
+images/待删除/待删除_e5f6.jpg
+images/未识别/未识别_0718.jpg
+```
+
+- 收进来的新图先落 `未识别/`；打上标签后自动搬进 `已识别/<标签名>/`，文件名改成 `<标签名>_<哈希前4位>.<ext>`（动图保持原扩展名）；
+- 多标签取第一个当目录名，其余标签仍留在库里；文件名哈希撞车时自动加长（`_a1b2c`…），不会互相覆盖；
+- 旧版平铺的 `<sha1>.<ext>` 会在启动时自动搬进分类目录（只搬根目录，不碰用户手动挪过的文件）。
+
+操作页顶部有 **「确认应用本地整理」** 按钮。在资源管理器里手动挪完图再点它：
+
+| 你做的事 | 同步结果 |
+|---|---|
+| 把图从 `无意义/` 挪到 `已识别/哈基米/` | 库标签改成「哈基米」，并记下这次人工修正（`manualTag` / `manualTagAt`，后续自动打标不会盖回去） |
+| 把图丢进 `待删除/` | 文件与库条目**物理删除**，不可撤销 |
+| 新建 `已识别/猫猫/`（哪怕还是空的） | 这个标签登记进库与配置词表，下次打标模型能选到 |
+| 把图挪到 `未识别/` | 清空标签（保留备注/文字） |
+| 把图挪到认不出的目录 / 库里没有的文件 | 只报告数量，不删不改 |
+
+同步是幂等的：自动整理出来的目录和配套文件名按设计就与「该在的位置」一致，不会把多标签误改成单标签。
 
 ### 定时备份
 
@@ -224,11 +251,14 @@ dsh plugin --profile desktop add "link:D:\\DeepSeekHarness_workarea\\Dsh-QQ-Mod\
 全部落在 `~/.dsh/plugin-data/dsh-qq-sticker/`（`$DSH_HOME` 优先）：
 
 ```
-library.json          索引（原子写，1.5s 防抖）
-images/<sha1>.<ext>   图片本体（内容寻址，天然去重）
-state.json            额度/预算/计数
-schedule.json         定时收集计划
-report.txt            最近一次报表
+library.json                    索引（原子写，1.5s 防抖）
+images/已识别/<标签名>/…        已打标的图，文件名 <标签名>_<哈希前4位>.<ext>
+images/无意义/…                 标「无意义」的图
+images/待删除/…                 同步时物理删除
+images/未识别/…                 刚收进来还没打标的图
+state.json                      额度/预算/计数
+schedule.json                   定时收集计划
+report.txt                      最近一次报表
 ```
 
 **不写插件包目录**（link 安装时那就是源码目录，HMR/更新会覆盖），也不写 workspace。
@@ -286,19 +316,20 @@ node test-load.mjs                 # 装载自检：模拟 DSH 的 import → Co
 node test-load.mjs --real-cordis   # ★ 用真 Cordis 装载（能复现真机的 proxy 陷阱错误）
 node test-cordis-regression.mjs    # 回归：Cordis「未声明服务属性」陷阱焊死
 node test-offline.mjs              # 78 条：库/闸/评分/解析/工具定义
-node test-integration.mjs          # 17 条：假 ctx 跑装配、agent/created、收图、发送、落盘
-node test-panel-client.mjs         # 76 条：面板槽位 / 三 Tab / 设置页 / 路径管理 / 数据通路 / CSS 红线
-node test-panel-host.mjs           # 39 条：Host 侧 jobs / actions / 路由 / state 字段
+node test-integration.mjs          # 18 条：假 ctx 跑装配、agent/created、收图、发送、落盘
+node test-panel-client.mjs         # 77 条：面板槽位 / 三 Tab / 设置页 / 路径管理 / 数据通路 / CSS 红线
+node test-panel-host.mjs           # 40 条：Host 侧 jobs / actions / 路由 / state 字段
+node test-tree.mjs                 # 14 条：物理目录 / 改名 / 文件夹同步 / 清理口径回归
 node test-panel-e2e.mjs            # 20 条：真实路由跑一遍，验 HTTP 状态码与响应体
 node test-contract.mjs             # 9 条：client 读的字段与 Host 返回的一致性
 node test-store.mjs                # 11 条：存储目录解析 / 搬迁 / 路径归一化
 node test-tagging.mjs              # 22 条：标签类别 / 词表合成 / 对齐 / 提示词
-node test-proactive.mjs            # 46 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
+node test-proactive.mjs            # 48 条：主动发图闸门 / 连发 / 斗图 / 团战 / 并发
 node test-zip-backup.mjs           # 36 条：ZIP 往返 + 系统解压验证 + 备份保留
 node test-config-writable.mjs      # 8 条：Config 可写性（源码 13 段/65 叶子 volatile + live Schema 比对）
 node test-gif.mjs                  # 15 条：GIF 收集放宽 / 原始图池 / 发送位置 / sub_type
 node test-rawimage.mjs             # 13 条：原始图转交协议（/raw-image + 冻结对象 + [[qqimg:]] 对齐）
-node test-llm-call.mjs             # 7 条：prepareCall/stream 配置一致（防「config changed」回归）
+node test-llm-call.mjs             # 10 条：prepareCall/stream 配置一致（防「config changed」回归）
 node test-persist.mjs              # 10 条：打标落盘 / 注入上下文识别 / 收集失败诊断
 ```
 

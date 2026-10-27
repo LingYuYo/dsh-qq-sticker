@@ -160,6 +160,10 @@ export class Vision {
         const text = oneLine(entry.text, 60)
         if (tags.length === 0 && !note && !text) continue
         this.library.annotate(item, { tags, note, text })
+        // 与批量打标同口径：收录时就判「无意义」也要累计失败次数，
+        // 否则统计里明明有、计数器却是 0（两套口径会让清理判不出来）。
+        if (tags.includes('无意义')) this.library.markTagFail(item)
+        else item.tagFails = 0
         tagged++
       } catch (error) {
         this.log('warn', `收录识图失败（这张先不标，之后可用「整理」补）：${error?.message ?? error}`)
