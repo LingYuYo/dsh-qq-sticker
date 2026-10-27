@@ -23,7 +23,10 @@ import { Library } from './src/library.js'
 import { createJobs } from './src/jobs.js'
 import { createActions } from './src/actions.js'
 import { DEFAULTS, readConfig } from './src/config.js'
-import { isSendable, migrateLayout, pendingTagFromName, rootTagFromName, walkImageFiles } from './src/tree.js'
+import {
+  findDirtyTagDirs, isSendable, migrateLayout, normalizeTagName,
+  pendingTagFromName, rootTagFromName, walkImageFiles,
+} from './src/tree.js'
 import { buildTools, TOOL_PREFIX } from './src/tools.js'
 import { shortId } from './src/library.js'
 
@@ -838,6 +841,131 @@ await check('认不出库的陌生文件：只移动/改名，**一个都不删*
     const rest = library.items.filter((item) => !item.tags.includes('开心'))
     assert.equal(rest.every((item) => item.tags.length === 0 && item.pending === true), true, '纯哈希/未识别_ 的应保持未识别')
     assert.equal(library.visible().length, 1, '只有 开心.jpg 那张能发')
+  })
+})
+
+// ════════════════════════════════════════════════════════════ 3.6 脏目录（真机事故回归）
+
+console.log('\n== 震惊 (1) / 震惊 (2)：不许建带括号的目录')
+
+await check('rootTagFromName：震惊 (1)/(2)/(3)/全角 全部严格等于「震惊」', async () => {
+  const names = ['震惊 (1).jpg', '震惊 (2).jpg', '震惊(3).jpg', '震惊（4）.jpg', '震惊 - 副本.jpg']
+  for (const name of names) {
+    assert.equal(rootTagFromName(name), '震惊', `${name} 的标签必须严格等于「震惊」`)
+  }
+  // 大写/多位数/前后空格都要稳
+  assert.equal(rootTagFromName('震惊 (12).jpg'), '震惊')
+  assert.equal(rootTagFromName(' 震惊 (2).jpg '), '震惊')
+})
+
+await check('normalizeTagName：目录名 震惊 (2) → 震惊（脏目录识别的基础）', async () => {
+  assert.equal(normalizeTagName('震惊 (2)'), '震惊')
+  assert.equal(normalizeTagName('震惊 (3)'), '震惊')
+  assert.equal(normalizeTagName('震惊（4）'), '震惊')
+  assert.equal(normalizeTagName('震惊 - 副本'), '震惊')
+  // 干净的不能被改坏
+  assert.equal(normalizeTagName('震惊'), '震惊')
+  assert.equal(normalizeTagName('开心'), '开心')
+})
+
+await check('复现真机：根目录 震惊 (1).jpg + 震惊 (2).jpg → 都进 已识别/震惊/，零括号目录', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    await mkdir(imagesDir, { recursive: true })
+    await writeFile(path.join(imagesDir, '震惊 (1).jpg'), makePng(10, 10, 101))
+    await writeFile(path.join(imagesDir, '震惊 (2).jpg'), makePng(10, 10, 102))
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 0, '一张都不许删')
+
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 2, `两张都该还在，实际 ${after.length}`)
+
+    const inShock = after.filter((file) => file.rel.startsWith('已识别/震惊/'))
+    assert.equal(inShock.length, 2, `两张都该在 已识别/震惊/，实际 ${inShock.map((f) => f.rel).join(',')}`)
+    for (const file of inShock) {
+      assert.match(file.rel, /^已识别\/震惊\/震惊_[0-9a-f]{4}\.jpg$/, `命名要规范，实际 ${file.rel}`)
+    }
+
+    // 核心断言：一个带括号的目录都不许有
+    const tagDirs = (await readdir(path.join(imagesDir, '已识别'))).filter((name) => name !== '待确认分类')
+    const dirty = tagDirs.filter((name) => /[（(]/.test(name))
+    assert.deepEqual(dirty, [], `不许出现带括号的标签目录，实际 ${dirty.join(',')}`)
+    assert.deepEqual(tagDirs, ['震惊'], `只该有一个标签目录，实际 ${tagDirs.join(',')}`)
+  })
+})
+
+await check('历史脏目录自动合并：已识别/震惊 (2)/ → 已识别/震惊/，脏目录物理删除', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    const dirtyDir = path.join(imagesDir, '已识别', '震惊 (2)')
+    await mkdir(dirtyDir, { recursive: true })
+    // 早期 bug 建出来的脏目录，里面是带括号命名的图
+    await writeFile(path.join(dirtyDir, '震惊 (2)_aaaa.jpg'), makePng(10, 10, 111))
+    await writeFile(path.join(dirtyDir, '震惊 (2)_bbbb.jpg'), makePng(10, 10, 112))
+    // 已经存在的干净目录（必须有图，验证合并不是覆盖）
+    await mkdir(path.join(imagesDir, '已识别', '震惊'), { recursive: true })
+    await writeFile(path.join(imagesDir, '已识别', '震惊', '震惊_cccc.jpg'), makePng(10, 10, 113))
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 0, '合并过程一张都不许删')
+
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 3, `三张都该还在，实际 ${after.length}`)
+    const dirtyLeft = after.filter((file) => file.rel.includes('震惊 (2)'))
+    assert.equal(dirtyLeft.length, 0, `脏目录里不该还有图，实际 ${dirtyLeft.map((f) => f.rel).join(',')}`)
+
+    const inShock = after.filter((file) => file.rel.startsWith('已识别/震惊/'))
+    assert.equal(inShock.length, 3, `三张都该在干净目录，实际 ${inShock.length}`)
+    for (const file of inShock) {
+      assert.match(file.rel, /^已识别\/震惊\/震惊_[0-9a-f]{4}\.jpg$/, `实际 ${file.rel}`)
+    }
+
+    // 脏目录必须被物理删掉
+    assert.equal(
+      await stat(dirtyDir).then(() => true, () => false),
+      false,
+      '脏目录 震惊 (2)/ 应被删除',
+    )
+    assert.ok(
+      Array.isArray(result.dirtyMerged) && result.dirtyMerged.some((line) => line.includes('震惊 (2)')),
+      `应报告合并动作，实际 ${JSON.stringify(result.dirtyMerged)}`,
+    )
+  })
+})
+
+await check('脏目录里的图要真的登记进库（不只挪文件）', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const imagesDir = path.join(dir, 'images')
+    const dirtyDir = path.join(imagesDir, '已识别', '难过 (3)')
+    await mkdir(dirtyDir, { recursive: true })
+    await writeFile(path.join(dirtyDir, '难过 (3)_dddd.jpg'), makePng(10, 10, 121))
+    assert.equal(library.items.length, 0, '一开始库里没条目')
+
+    await sync(runtime)
+    const after = await walkImageFiles(imagesDir)
+    assert.equal(after.length, 1)
+    assert.match(after[0].rel, /^已识别\/难过\/难过_[0-9a-f]{4}\.jpg$/, `实际 ${after[0].rel}`)
+    // 脏目录里的图不在旧索引里 → 合并后要按「陌生文件」那套登记进库
+    const tagged = library.items.filter((item) => item.tags.includes('难过'))
+    assert.equal(tagged.length, 1, `该登记 1 条「难过」，实际 ${library.items.length}`)
+    assert.equal(await stat(path.join(imagesDir, '已识别', '难过 (3)')).then(() => true, () => false), false)
+  })
+})
+
+await check('findDirtyTagDirs：只认带副本尾巴的目录，干净目录不碰', async () => {
+  await withTempDir(async (dir) => {
+    const imagesDir = path.join(dir, 'images')
+    for (const name of ['震惊 (2)', '震惊（3）', '开心', '悲伤', '待确认分类']) {
+      await mkdir(path.join(imagesDir, '已识别', name), { recursive: true })
+    }
+    const dirty = await findDirtyTagDirs(imagesDir)
+    const names = dirty.map((entry) => entry.dirty).sort()
+    assert.deepEqual(names, ['震惊 (2)', '震惊（3）'], `只该认出两个脏目录，实际 ${names.join(',')}`)
+    for (const entry of dirty) assert.equal(entry.clean, '震惊')
   })
 })
 

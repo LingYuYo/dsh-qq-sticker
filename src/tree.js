@@ -137,7 +137,7 @@ export function pendingTagFromName(name) {
   if (words.length === 0) return ''
   const tag = words[words.length - 1]
   if (!tag || tag === TREE_DIRS.pending) return ''
-  return sanitizeTagName(tag)
+  return normalizeTagName(tag)
 }
 
 /** 取条目哈希（默认前 4 位；没有 src 时回退到文件名里的哈希）。 */
@@ -177,7 +177,9 @@ export function placementRel(category, tag, hash, ext) {
     return `${label}/${label}_${hash}${suffix}`
   }
   if (category === 'identified') {
-    const label = sanitizeTagName(tag)
+    // ⚠️ 用 normalizeTagName（先剥副本尾巴）：`震惊 (2)` 必须落进 `已识别/震惊/`，
+    //    而不是建一个带括号的新目录。
+    const label = normalizeTagName(tag)
     return `${TREE_DIRS.identified}/${label}/${label}_${hash}${suffix}`
   }
   if (category === 'pending') {
@@ -248,30 +250,50 @@ export function isSendable(item, config) {
 }
 
 /**
- * 去掉 Windows 重名文件的尾巴。
+ * 去掉所有「副本 / 重名」尾巴：`(1)`、`(2)`、`（3）`、`- 副本`、`_副本`。
  *
- * 同一张图在资源管理器里再存一份，系统会自动加后缀：
- *   `震惊.jpg` → `震惊 (2).jpg`、`震惊(3).jpg`、`震惊（4）.jpg`（中文输入法的全角括号）
+ * 资源管理器里再存一份会自动加这些后缀：
+ *   `震惊.jpg` → `震惊 (2).jpg`、`震惊(3).jpg`、`震惊（4）.jpg`（中文输入法全角括号）
  *   `震惊.jpg` → `震惊 - 副本.jpg`
  *
- * ⚠️ 这些尾巴必须剥掉再解析标签，否则 `震惊 (2)` 会变成一个叫「震惊 (2)」的标签、
- * 建出一个叫「震惊 (2)」的目录 —— 用户放两张同名图就得到两个目录。
+ * ⚠️ 必须**先剥再解析**，否则 `震惊 (2)` 会变成一个叫「震惊 (2)」的标签、
+ * 建出 `已识别/震惊 (2)/` 这种脏目录。2026-10-27 真机就是这么炸的：
+ * 根目录放 `震惊 (1).jpg` / `震惊 (2).jpg`，同步后多出两个带括号的目录。
  *
- * 只剥**结尾**的副本标记；`副本` 必须带分隔符（` - ` / ` — ` / `_`）才算，
- * 免得把真叫「副本」的标签吃掉。
+ * ⚠️ 与旧版的区别：**不再只剥结尾**。旧的 `$` 锚定版本对
+ * `震惊 (2)_1d5f.jpg`（括号在中间）无效，而且目录名
+ * `已识别/震惊 (2)/` 完全走的是另一条路（目录名当标签），压根没过这个函数。
+ * 现在改成全文替换，文件名与目录名共用。
+ *
+ * `副本` 仍要求带分隔符（`- 副本` / `_副本` / ` - 副本`），
+ * 免得把真叫「震惊副本」的标签吃掉。
  *
  * @param {string} text
  * @returns {string}
  */
 export function stripCopySuffix(text) {
   let out = String(text ?? '').trim()
-  // 连剥几次：`震惊 (2) (3).jpg` 这类叠了两层的也要干净
+  // 连剥几轮：`震惊 (2) (3)` 这类叠了两层的也要干净（replace 带 g 已能一次去多个，
+  // 但括号里套括号这种残缺写法要靠第二轮回稳）
   for (let round = 0; round < 5; round++) {
-    const next = out.replace(/(?:\s*[（(]\d{1,3}[)）]|\s*[-—_]\s*副本)\s*$/u, '').trim()
+    const next = out
+      .replace(/[\s_\-—]*[（(]\s*\d{1,3}\s*[)）]/gu, '')
+      .replace(/[\s_\-—]+副本/gu, '')
+      .trim()
     if (next === out) break
     out = next
   }
   return out
+}
+
+/**
+ * 标签名统一清洗：去副本尾巴 → 清非法字符 → 限长。
+ *
+ * 文件名的标签解析、目录名的标签解析、以及入库时的标签，全都走这里，
+ * 保证「同一个标签只有一种写法」（不会同时存在 `震惊` 和 `震惊 (2)`）。
+ */
+export function normalizeTagName(raw) {
+  return sanitizeTagName(stripCopySuffix(raw))
 }
 
 /** 是不是我们命名的图片文件（**只用于识别命名格式，绝不能用来决定删不删**）。 */
@@ -298,8 +320,14 @@ export function isOurFileName(name) {
  * @returns {string} 标签名，或 '' 表示没有标签（当未识别）
  */
 export function rootTagFromName(name) {
-  const base = stripCopySuffix(path.basename(String(name ?? '')).replace(/\.[a-z0-9]+$/i, ''))
-  const first = base.split('_')[0].trim()
+  // ⚠️ 顺序：**先 trim、去扩展名，再剥副本尾巴**。
+  //    反过来的话 `震惊 - 副本.jpg` 里的 `.jpg` 还挂在末尾，
+  //    正则匹配「- 副本」后面有 `.jpg`，剥不干净 → 得到 `震惊.jpg`。
+  //    同理 ` 震惊 (2).jpg ` 这种带空格的，不 trim 则扩展名正则也匹配不上。
+  const base = stripCopySuffix(path.basename(String(name ?? '')).trim().replace(/\.[a-z0-9]+$/i, ''))
+  // 按「第一个空格或下划线」切：`震惊 (1)` 剥完是 `震惊`；
+  // 万一括号没剥干净（`震惊 别的`），空格也能兜住。
+  const first = base.split(/[\s_]+/u)[0].trim()
   if (!first) return ''
   // 占位名 / 纯哈希 → 没有标签
   if (first === TREE_DIRS.untagged) return ''
@@ -307,7 +335,7 @@ export function rootTagFromName(name) {
   if (first === TREE_DIRS.identified) return ''
   if (first === TREE_DIRS.meaningless) return '无意义'
   if (HASH_TOKEN_RE.test(first)) return ''
-  return sanitizeTagName(first)
+  return normalizeTagName(first)
 }
 
 /**
@@ -399,9 +427,11 @@ export function categoryOfRel(rel) {
     if (second === TREE_DIRS.pending) {
       // 直接放在 待确认分类/ 下 → 从文件名解析；放在子目录里 → 目录名就是标签
       if (parts.length === 3) return { kind: 'pending', tag: '' }
-      return { kind: 'pending', tag: parts[2] }
+      return { kind: 'pending', tag: normalizeTagName(parts[2]) }
     }
-    return { kind: 'identified', tag: second }
+    // ⚠️ 目录名也要清洗：`已识别/震惊 (2)/` 是脏目录（早期版本按重名文件名建的），
+    //    它的标签必须解析成「震惊」而不是「震惊 (2)」。
+    return { kind: 'identified', tag: normalizeTagName(second) }
   }
 
   return { kind: 'unknown', reason: `不认识的目录：${top}` }
@@ -434,6 +464,101 @@ export async function listPendingTagDirs(imagesDir) {
   } catch {
     return []
   }
+}
+
+/**
+ * 找出 `已识别/` 下的**脏标签目录**并合并回干净的标签目录。
+ *
+ * 2026-10-27 真机：根目录放 `震惊 (1).jpg` / `震惊 (2).jpg`，早期版本按
+ * 文件名里那个没剥干净的词建出了 `已识别/震惊 (2)/`、`已识别/震惊 (3)/`。
+ * 修了正则只保证**以后**不再建脏目录，已经建出来的还得收回来。
+ *
+ * 判定：目录名剥掉副本尾巴后 ≠ 目录名本身，就是脏的。
+ *   `震惊 (2)` → 干净名 `震惊`
+ *   `开心`     → 不变，不是脏目录
+ *
+ * @param {string} imagesDir
+ * @returns {Promise<Array<{dirty:string, clean:string, abs:string, cleanAbs:string}>>}
+ */
+export async function findDirtyTagDirs(imagesDir) {
+  const out = []
+  const identifiedDir = path.join(imagesDir, TREE_DIRS.identified)
+  let entries
+  try {
+    entries = await readdir(identifiedDir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    if (entry.name === TREE_DIRS.pending) continue
+    const clean = normalizeTagName(entry.name)
+    if (!clean || clean === entry.name) continue
+    out.push({
+      dirty: entry.name,
+      clean,
+      abs: path.join(identifiedDir, entry.name),
+      cleanAbs: path.join(identifiedDir, clean),
+    })
+  }
+  return out
+}
+
+/**
+ * 把脏目录里的图搬到干净目录，然后删掉空掉的脏目录。
+ *
+ * ⚠️ 只**移动 + 删空目录**，绝不删里面的图片：
+ *   · 目标重名就加 `-2`、`-3` 后缀（不覆盖）；
+ *   · 脏目录里还有搬不动的（被占用 / 子目录）：保留，只记 note。
+ *
+ * @param {string} imagesDir
+ * @param {object} [opts]
+ * @param {(from:string, to:string)=>void} [opts.onMove] 每搬一张回调（用于同步索引）
+ * @returns {Promise<{merged:string[], moved:number, removedDirs:string[], notes:string[]}>}
+ */
+export async function mergeDirtyTagDirs(imagesDir, { onMove } = {}) {
+  const dirty = await findDirtyTagDirs(imagesDir)
+  const merged = []
+  const removedDirs = []
+  const notes = []
+  let moved = 0
+  for (const entry of dirty) {
+    await mkdir(entry.cleanAbs, { recursive: true })
+    let names = []
+    try {
+      names = (await readdir(entry.abs, { withFileTypes: true }))
+        .filter((item) => item.isFile() && !item.name.startsWith('.') && IMAGE_EXT_RE.test(item.name))
+        .map((item) => item.name)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      const sourceAbs = path.join(entry.abs, name)
+      // 目标文件名也顺手规范化：脏目录里的文件可能叫 `震惊 (2)_abcd.jpg`
+      const cleanName = `${normalizeTagName(name.replace(/\.[a-z0-9]+$/i, ''))}${path.extname(name)}`
+      const target = await uniqueAbs(imagesDir, `${TREE_DIRS.identified}/${entry.clean}/${cleanName}`)
+      try {
+        await mkdir(path.dirname(target.abs), { recursive: true })
+        await rename(sourceAbs, target.abs)
+        moved++
+        onMove?.(`${TREE_DIRS.identified}/${entry.dirty}/${name}`, target.rel)
+      } catch (error) {
+        notes.push(`${entry.dirty}/${name} 搬不动：${error?.message ?? error}`)
+      }
+    }
+    // 空目录才删（窗口里还开着资源管理器时会失败，忽略即可）
+    try {
+      const rest = (await readdir(entry.abs)).filter((name) => !name.startsWith('.'))
+      if (rest.length === 0) {
+        await rmdir(entry.abs)
+        removedDirs.push(entry.dirty)
+        merged.push(`${entry.dirty} → ${entry.clean}`)
+      } else {
+        notes.push(`${entry.dirty}/ 里还剩 ${rest.length} 项（不是图片？），目录先留着`)
+      }
+    } catch { /* 目录不存在 / 被占用：不影响合并结果 */ }
+  }
+  return { merged, moved, removedDirs, notes }
 }
 
 /**
@@ -647,7 +772,20 @@ export async function migrateLayout(imagesDir) {
     renamed.push(`images/${TREE_DIRS.untagged}/ → images/ 根目录`)
   }
 
-  return { movedToRoot, renamed, merged, notes }
+  // ③ 脏标签目录合并（`已识别/震惊 (2)/` → `已识别/震惊/`）
+  const dirty = await mergeDirtyTagDirs(imagesDir)
+  for (const line of dirty.merged) renamed.push(`已识别/${line}`)
+  notes.push(...dirty.notes)
+  if (dirty.moved > 0) notes.push(`脏目录里的 ${dirty.moved} 张图已并入干净目录`)
+
+  return {
+    movedToRoot,
+    renamed,
+    merged: merged + dirty.moved,
+    notes,
+    dirtyDirsMerged: dirty.merged,
+    dirtyDirsRemoved: dirty.removedDirs,
+  }
 }
 
 /**
@@ -673,6 +811,13 @@ export async function migrateLayout(imagesDir) {
  */
 export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
   await ensureTreeDirs(imagesDir)
+  // ⚠️ 先把脏标签目录并回干净目录（`震惊 (2)/` → `震惊/`），再列文件。
+  //    顺序不能反：先列的话会按脏目录名算出「震惊 (2)」这个标签，
+  //    图还没搬就已经被判定成了另一个分类。
+  const dirtyMerge = await mergeDirtyTagDirs(imagesDir)
+  // 脏目录里的图被挪了位置，索引里还是旧路径 —— 按内容哈希把它们找回来，
+  // 不然后面 relocate 会把「旧路径不存在」当成文件丢失。
+  if (dirtyMerge.moved > 0) await reconcilePaths(imagesDir, items ?? [])
   const files = await walkImageFiles(imagesDir)
   const itemBySrc = new Map()
   for (const item of items ?? []) {
@@ -685,6 +830,8 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
   const deletes = []
   /** 认不出库条目、但用户明确要求挪位置的文件（按物理路径处理）。 */
   const moves = []
+  /** 认不出库条目、但**位置已经正确**的文件（直接登记进库，不动文件）。 */
+  const adopts = []
   let unchanged = 0
 
   for (const file of files) {
@@ -767,6 +914,16 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
           continue
         }
       }
+      if (category.kind === 'identified') {
+        // 图已经在 `已识别/<标签>/` 里、但库里没条目（典型：刚从脏目录合并过来、
+        // 或者用户手动把图丢进了标签目录）。**位置已经正确，不用挪**，直接登记进库。
+        adopts.push({
+          rel: file.rel,
+          abs: file.abs,
+          tag: normalizeTagName(category.tag),
+        })
+        continue
+      }
       unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（没动它）' })
       continue
     }
@@ -786,21 +943,21 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
     // 文件夹和它一致 → 是自动整理的结果，不能动标签（多标签取第一个当目录，
     // 其余标签必须保留）；只有文件夹**跟自动位置不一致**才算用户手动挪过。
     const auto = placementFor(item)
-    const autoTag = auto.category === 'identified' ? sanitizeTagName(auto.tag) : ''
+    const autoTag = auto.category === 'identified' ? normalizeTagName(auto.tag) : ''
     let desiredTags = [...(item.tags ?? [])]
     let desiredPending = item.pending === true
     let manual = false
     let restored = false
 
     if (category.kind === 'identified') {
-      const folderTag = sanitizeTagName(category.tag)
+      const folderTag = normalizeTagName(category.tag)
       if (folderTag !== autoTag) {
         desiredTags = [folderTag]
         desiredPending = false
         manual = true
       }
     } else if (category.kind === 'pending') {
-      const tag = category.tag ? sanitizeTagName(category.tag) : pendingTagFromName(file.name)
+      const tag = category.tag ? normalizeTagName(category.tag) : pendingTagFromName(file.name)
       if (tag) {
         desiredTags = [tag]
         desiredPending = false
@@ -883,10 +1040,15 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
     changes,
     deletes,
     moves,
+    adopts,
     newTags,
     tagFolders,
     pendingTagFolders,
     missing,
+    // 脏目录自动合并的结果（`已识别/震惊 (2)/` → `震惊/`）
+    dirtyMerged: dirtyMerge.merged,
+    dirtyRemoved: dirtyMerge.removedDirs,
+    dirtyMoved: dirtyMerge.moved,
   }
 }
 
@@ -916,6 +1078,9 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     unknown: plan.unknown.length,
     duplicates: plan.duplicates.length,
     newTags: plan.newTags,
+    // 脏目录合并发生在 analyzeTree 阶段（已经执行完毕），这里只是把结果带出去
+    dirtyMerged: plan.dirtyMerged ?? [],
+    dirtyMoved: plan.dirtyMoved ?? 0,
     corrections: [],
     errors: [],
   }
@@ -935,6 +1100,7 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
       from: [...(entry.item.tags ?? [])],
       to: entry.tags,
     }))
+    result.adopted = plan.adopts?.length ?? 0
     return result
   }
 
@@ -986,7 +1152,25 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     }
   }
 
-  // ③ 改标签 / 换位置（人工修正要留痕，后续打标不能把它盖回去）
+  // ③ 位置已经正确、但库里没条目的图：直接登记（不动文件）
+  //
+  // 典型来源：脏目录合并过来的图（`已识别/震惊 (2)/` → `已识别/震惊/`），
+  // 或者用户手动把图丢进了某个标签目录。它们的位置本来就对，只需要补一条库记录。
+  for (const entry of plan.adopts ?? []) {
+    try {
+      const adopted = await library.adoptFile?.({
+        abs: entry.abs,
+        rel: entry.rel,
+        tags: entry.tag ? [entry.tag] : [],
+        pending: !entry.tag,
+      })
+      if (adopted) result.adopted++
+    } catch (error) {
+      result.errors.push(`登记 ${entry.rel} 失败：${error?.message ?? error}`)
+    }
+  }
+
+  // ④ 改标签 / 换位置（人工修正要留痕，后续打标不能把它盖回去）
   for (const entry of plan.changes) {
     try {
       const item = entry.item

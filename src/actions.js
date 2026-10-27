@@ -440,6 +440,9 @@ export function createActions({ runtime, jobs, log } = {}) {
         await lib.flush()
 
         const parts = []
+        if (Array.isArray(result.dirtyMerged) && result.dirtyMerged.length > 0) {
+          parts.push(`合并脏目录 ${result.dirtyMerged.join('、')}`)
+        }
         if (result.retagged > 0) parts.push(`改标签 ${result.retagged} 张`)
         if (result.deleted > 0) parts.push(`物理删除 ${result.deleted} 张`)
         if (result.reviewDeleted > 0) parts.push(`无意义/待删除 清掉 ${result.reviewDeleted} 张`)
@@ -466,6 +469,8 @@ export function createActions({ runtime, jobs, log } = {}) {
           unknown: result.unknown,
           duplicates: result.duplicates,
           newTags: result.newTags,
+          dirtyMerged: result.dirtyMerged ?? [],
+          dirtyMoved: result.dirtyMoved ?? 0,
           tagsSaved,
           corrections: result.corrections.slice(0, 10),
           errors: result.errors.slice(0, 10),
