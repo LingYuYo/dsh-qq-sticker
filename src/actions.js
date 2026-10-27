@@ -440,6 +440,7 @@ export function createActions({ runtime, jobs, log } = {}) {
         if (result.retagged > 0) parts.push(`改标签 ${result.retagged} 张`)
         if (result.deleted > 0) parts.push(`物理删除 ${result.deleted} 张`)
         if (result.moved > 0) parts.push(`换位置 ${result.moved} 张`)
+        if (result.pending > 0) parts.push(`转入待确认 ${result.pending} 张`)
         if (result.newTags.length > 0) parts.push(`新标签 ${result.newTags.join('、')}`)
         if (result.unknown > 0) parts.push(`${result.unknown} 个文件没对上库（未动）`)
         const detail = dryRun
@@ -453,6 +454,7 @@ export function createActions({ runtime, jobs, log } = {}) {
           deleted: result.deleted,
           retagged: result.retagged,
           moved: result.moved,
+          pending: result.pending,
           adopted: result.adopted,
           unknown: result.unknown,
           duplicates: result.duplicates,

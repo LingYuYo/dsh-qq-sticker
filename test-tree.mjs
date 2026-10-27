@@ -107,6 +107,29 @@ async function waitJob(runtime, kind, timeoutMs = 5000) {
   }, timeoutMs)
 }
 
+/** 模拟用户在资源管理器里把图挪到某个相对路径。 */
+async function moveItemTo(library, item, rel) {
+  const abs = path.join(library.dataDir, 'images', rel)
+  await mkdir(path.dirname(abs), { recursive: true })
+  await rename(item.path, abs)
+  item.file = rel
+  item.path = abs
+  return abs
+}
+
+/** 跑一次同步并等它结束（按 job id 等，避免拿到上一次的旧结果）。 */
+async function sync(runtime) {
+  const started = runtime.actions.run('sync_tree', {})
+  assert.equal(started.ok, true, started.reason ?? '')
+  const id = started.job.id
+  const job = await waitFor(() => {
+    const hit = runtime.jobs.list().find((entry) => entry.id === id && entry.status !== 'running')
+    return hit
+  })
+  assert.equal(job.status, 'done', job.error || '')
+  return job.result
+}
+
 // ════════════════════════════════════════════════════════════ 1. 入库 / 改名
 
 console.log('== 物理目录与命名')
@@ -309,6 +332,157 @@ await check('第二次同步幂等：不重复改标签、不再报新标签', a
     assert.equal(first.result.retagged, 0)
     assert.equal(first.result.newTags.length, 0)
     assert.equal(first.result.unchanged >= 1, true, '应至少有一张被判「没变化」')
+  })
+})
+
+await check('待确认分类：生气_<哈希>.png → 标签改生气，文件搬进 已识别/生气/', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 41) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    await moveItemTo(library, item, `已识别/待确认分类/生气_${item.src.slice(0, 4)}.png`)
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, ['生气'])
+    assert.equal(item.pending, false)
+    assert.equal(item.file, `已识别/生气/生气_${item.src.slice(0, 4)}.png`)
+    assert.equal(result.retagged, 1)
+    assert.equal(result.corrections[0].to.includes('生气'), true)
+    assert.equal(await stat(item.path).then((info) => info.isFile()), true)
+  })
+})
+
+await check('待确认分类：沙雕_<哈希>_生气.png 取最后一个非哈希词（生气）', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 42) })
+    library.annotate(item, { tags: ['沙雕'] })
+    await library.flush()
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `已识别/待确认分类/沙雕_${hash}_生气.png`)
+
+    await sync(runtime)
+    assert.deepEqual(item.tags, ['生气'])
+    assert.equal(item.file, `已识别/生气/生气_${hash}.png`)
+  })
+})
+
+await check('待确认分类：新建子目录 哈基米/ 里的图，目录名就是新标签', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 43) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    await moveItemTo(library, item, `已识别/待确认分类/哈基米/随手改的名字.png`)
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, ['哈基米'])
+    assert.equal(item.pending, false)
+    assert.equal(item.file, `已识别/哈基米/哈基米_${item.src.slice(0, 4)}.png`)
+    assert.equal(result.newTags.includes('哈基米'), true)
+  })
+})
+
+await check('待确认分类：占位名 待确认分类_<哈希>.png 不产生标签，留在待确认并清空旧标签', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 44) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `已识别/待确认分类/待确认分类_${hash}.png`)
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, [])
+    assert.equal(item.pending, true)
+    assert.equal(item.file, `已识别/待确认分类/待确认分类_${hash}.png`)
+    assert.equal(result.pending, 1)
+    assert.equal(library.visible().length, 0, '待确认的图不该进打标/发送候选')
+
+    // 再同步一次必须幂等
+    const again = await sync(runtime)
+    assert.equal(again.retagged, 0)
+    assert.equal(again.moved, 0)
+    assert.equal(item.file, `已识别/待确认分类/待确认分类_${hash}.png`)
+  })
+})
+
+await check('已识别 根目录散图：统一搬进待确认分类并清空标签', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 45) })
+    library.annotate(item, { tags: ['开心'] })
+    await library.flush()
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `已识别/散图_${hash}.png`)
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, [])
+    assert.equal(item.pending, true)
+    assert.equal(item.file, `已识别/待确认分类/待确认分类_${hash}.png`)
+    assert.equal(result.pending, 1)
+    assert.equal(result.moved, 1)
+  })
+})
+
+await check('无意义/真：移进待确认分类并清空标签', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 46) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    const hash = item.src.slice(0, 4)
+    await moveItemTo(library, item, `无意义/真/真_${hash}.png`)
+
+    const result = await sync(runtime)
+    assert.deepEqual(item.tags, [])
+    assert.equal(item.pending, true)
+    assert.equal(item.file, `已识别/待确认分类/待确认分类_${hash}.png`)
+    assert.equal(result.pending, 1)
+    assert.equal(await stat(item.path).then((info) => info.isFile()), true)
+  })
+})
+
+await check('无意义/假：条目和文件都被物理删除', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime, library } = await makeRuntime(dir)
+    const { item } = await library.ingest({ bytes: makePng(24, 24, 47) })
+    library.annotate(item, { tags: ['无意义'] })
+    await library.flush()
+    const target = await moveItemTo(library, item, `无意义/假/假_${item.src.slice(0, 4)}.png`)
+
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 1)
+    assert.equal(library.items.length, 0)
+    assert.equal(await stat(target).then(() => true, () => false), false)
+  })
+})
+
+await check('无意义/假 里认不出库的陌生文件也物理删除（用户明确说假）', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime } = await makeRuntime(dir)
+    const stray = path.join(dir, 'images', '无意义', '假', '随便一张.jpg')
+    await mkdir(path.dirname(stray), { recursive: true })
+    await writeFile(stray, Buffer.from('not really an image, but user said delete'))
+    const result = await sync(runtime)
+    assert.equal(result.deleted, 1)
+    assert.equal(await stat(stray).then(() => true, () => false), false)
+  })
+})
+
+await check('已识别 根目录的陌生散图：也搬进待确认分类（只动文件）', async () => {
+  await withTempDir(async (dir) => {
+    const { runtime } = await makeRuntime(dir)
+    const stray = path.join(dir, 'images', '已识别', '陌生散图.jpg')
+    await mkdir(path.dirname(stray), { recursive: true })
+    await writeFile(stray, makePng(10, 10, 3))
+    const result = await sync(runtime)
+    assert.equal(result.pending, 1, '应转入待确认 1 张')
+    const files = await walkImageFiles(path.join(dir, 'images'))
+    const pending = files.find((file) => file.rel.startsWith('已识别/待确认分类/'))
+    assert.ok(pending, '陌生散图应被移到待确认分类')
+    assert.equal(await stat(stray).then(() => true, () => false), false)
   })
 })
 

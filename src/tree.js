@@ -2,13 +2,21 @@
  * 物理文件夹分类：把 images/ 从「一堆哈希平铺」改成看得懂的目录树。
  *
  * 布局（相对 images/）：
- *   · 已识别/<标签名>/<标签名>_<哈希前4位>.<ext>
- *   · 无意义/无意义_<哈希前4位>.<ext>
- *   · 待删除/待删除_<哈希前4位>.<ext>      ← 同步时物理删除
- *   · 未识别/未识别_<哈希前4位>.<ext>      ← 收进来还没打标
+ *   · 已识别/<标签名>/<标签名>_<哈希前4位>.<ext>      正常已分类
+ *   · 已识别/待确认分类/待确认分类_<哈希前4位>.<ext>  ← 人工改标签的唯一入口
+ *   · 无意义/无意义_<哈希前4位>.<ext>                 自动判「无意义」
+ *   · 无意义/真/<...>                                 人工复核：确实无意义，转待确认
+ *   · 无意义/假/<...>                                 人工复核：误判，直接物理删除
+ *   · 待删除/待删除_<哈希前4位>.<ext>                 同步时物理删除
+ *   · 未识别/未识别_<哈希前4位>.<ext>                 收进来还没打标
  *
- * 为什么文件名要带标签和哈希：用户能直接按文件名认图；哈希前缀又能让「用户
- * 手动挪了目录」被同步逻辑反查到数据库条目（同名冲突时自动加长哈希）。
+ * 人工改标签的约定（2026-10-27 最终版）：
+ *   把图从别的目录剪切到 `已识别/待确认分类/`，改名为 `新标签_原哈希.jpg`。
+ *   例如 `生气_1d5f.jpg`；也可以在原名后面追加新标签，如 `沙雕_1d5f_生气.jpg`。
+ *   解析规则：非哈希词只有一个 → 就是新标签；有多个 → 取**最后一个**
+ *   （用户在原名后追加新标签的写法）。占位名 `待确认分类_1d5f.jpg` 不产生标签。
+ *
+ * 已识别 根目录不再接受散图：扫描到就统一搬进 待确认分类 并清空标签。
  *
  * 约定：item.file 一律存**相对 images/ 的 POSIX 路径**（`已识别/开心/开心_a1b2.jpg`）。
  * Windows 上 `path.join(imagesDir, item.file)` 照样能用；比较/落盘前统一 toPosix()。
@@ -18,25 +26,30 @@ import { mkdir, readFile, readdir, rename } from 'node:fs/promises'
 
 import { fileInfo, removeFile, sha1 } from './util.js'
 
-/** 四个基础分类目录（物理目录名，直接给用户看）。 */
+/** 物理目录名（直接给用户看）。 */
 export const TREE_DIRS = {
   identified: '已识别',
+  pending: '待确认分类',
+  reviewTrue: '真',
+  reviewFalse: '假',
   meaningless: '无意义',
   pendingDelete: '待删除',
   untagged: '未识别',
 }
 
-/** 基础分类目录清单（同步/清理时用来认「这是我们的目录」）。 */
-export const TREE_ROOT_NAMES = Object.values(TREE_DIRS)
-const TREE_ROOT_SET = new Set(TREE_ROOT_NAMES)
+/** 顶层分类目录（不含 待确认分类、真、假 —— 它们是嵌套的）。 */
+export const TREE_ROOT_NAMES = [
+  TREE_DIRS.identified,
+  TREE_DIRS.meaningless,
+  TREE_DIRS.pendingDelete,
+  TREE_DIRS.untagged,
+]
 
 /** 图片扩展名（含大小写）。 */
 export const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i
 
-/** 我们自己的文件名形状：`<标签>_<4~40位hex>[-序号].<ext>`。 */
-const OUR_NAME_RE = /_[0-9a-f]{4,40}(?:-\d+)?\.[a-z0-9]+$/i
-/** 旧版平铺文件名：`<16位hex>.<ext>`。 */
-const LEGACY_NAME_RE = /^[0-9a-f]{4,40}(?:-\d+)?\.[a-z0-9]+$/i
+/** 哈希 token 形态（4~40 位十六进制，允许 `-2` 这类重名后缀）。 */
+const HASH_TOKEN_RE = /^[0-9a-f]{4,40}(?:-\d+)?$/i
 
 /** 路径 → POSIX 分隔符（索引里统一用这个）。 */
 export function toPosix(value) {
@@ -75,13 +88,58 @@ export function sanitizeTagName(raw) {
   return text.slice(0, 30)
 }
 
+/** 文件名去掉扩展名后的 token（`沙雕_1d5f_生气` → ['沙雕','1d5f','生气']）。 */
+function tokensOfName(name) {
+  return path.basename(String(name ?? ''))
+    .replace(/\.[a-z0-9]+$/i, '')
+    .split(/_+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+}
+
+/**
+ * 文件名里的哈希 token（4~40 位十六进制）。认不出返回 ''。
+ *
+ * 不要求哈希在末尾：`沙雕_1d5f_生气.jpg` 也要能认出 1d5f，否则用户按最终
+ * 规则改名后，重启自愈会找不到文件。
+ */
+export function hashInName(name) {
+  const base = path.basename(String(name ?? ''))
+  for (const token of tokensOfName(base)) {
+    if (HASH_TOKEN_RE.test(token)) return token.toLowerCase()
+  }
+  // 旧版平铺文件名（`a1b2c3d4e5f6.jpg`）没有下划线，token 循环已经覆盖；
+  // 这里再兜一次 `-2` 后缀被点号截断之类的情况。
+  const match = /^([0-9a-f]{4,40})(?:-\d+)?\.[a-z0-9]+$/i.exec(base)
+  return match?.[1]?.toLowerCase() ?? ''
+}
+
+/**
+ * 从 `已识别/待确认分类/` 里的文件名解析新标签。
+ *
+ *   `生气_1d5f.jpg`        → 生气        （只有一个非哈希词）
+ *   `沙雕_1d5f_生气.jpg`   → 生气        （多个非哈希词取最后一个）
+ *   `待确认分类_1d5f.jpg`  → ''          （占位名，还没想好标签）
+ *   `1d5f.jpg`             → ''          （只有哈希）
+ *
+ * @param {string} name 文件名
+ * @returns {string} 标签名，或 '' 表示还没指定
+ */
+export function pendingTagFromName(name) {
+  const tokens = tokensOfName(name)
+  const words = tokens.filter((token) => !HASH_TOKEN_RE.test(token))
+  if (words.length === 0) return ''
+  const tag = words[words.length - 1]
+  if (!tag || tag === TREE_DIRS.pending) return ''
+  return sanitizeTagName(tag)
+}
+
 /** 取条目哈希（默认前 4 位；没有 src 时回退到文件名里的哈希）。 */
 export function hashOf(item, len = 4) {
   const src = String(item?.src ?? '').trim()
   if (src) return src.slice(0, Math.max(1, len))
-  const base = path.basename(toPosix(item?.file ?? '')).replace(/\.[a-z0-9]+$/i, '')
-  const match = /_([0-9a-f]{4,40})$/i.exec(base) ?? LEGACY_NAME_RE.exec(base)
-  return (match?.[1] ?? 'xxxx').slice(0, Math.max(1, len))
+  const hash = hashInName(item?.file ?? '')
+  return (hash || 'xxxx').slice(0, Math.max(1, len))
 }
 
 /** 条目的图片扩展名（不带点）。 */
@@ -103,6 +161,10 @@ export function placementRel(category, tag, hash, ext) {
     const label = sanitizeTagName(tag)
     return `${TREE_DIRS.identified}/${label}/${label}_${hash}${suffix}`
   }
+  if (category === 'pending') {
+    const label = TREE_DIRS.pending
+    return `${TREE_DIRS.identified}/${label}/${label}_${hash}${suffix}`
+  }
   const label = TREE_DIRS.untagged
   return `${label}/${label}_${hash}${suffix}`
 }
@@ -110,14 +172,17 @@ export function placementRel(category, tag, hash, ext) {
 /**
  * 条目**应该**放在哪。
  *
- * 多标签时取第一个标签当目录名（其余标签仍留在数据库里）；「无意义」优先于
- * 一切标签（它是删除判定的哨兵）。
+ * `item.pending === true` 优先级最高：这是「等着人工分类」的图，哪怕 tags
+ * 里还残留旧值，也先待在 待确认分类。其次是「无意义」哨兵，再按第一个标签。
  *
  * @returns {{category:string, tag:string, rel:string, ext:string}}
  */
 export function placementFor(item) {
   const tags = Array.isArray(item?.tags) ? item.tags.map(String) : []
   const ext = extOf(item)
+  if (item?.pending === true) {
+    return { category: 'pending', tag: '', rel: placementRel('pending', '', hashOf(item, 4), ext), ext }
+  }
   if (tags.includes('无意义')) {
     return { category: 'meaningless', tag: '', rel: placementRel('meaningless', '', hashOf(item, 4), ext), ext }
   }
@@ -128,26 +193,21 @@ export function placementFor(item) {
   return { category: 'untagged', tag: '', rel: placementRel('untagged', '', hashOf(item, 4), ext), ext }
 }
 
-/**
- * 文件名里的哈希前缀（4~40 位）。认不出返回 ''。
- * 兼容新版 `开心_a1b2.jpg` 与旧版 `a1b2c3d4e5f6.jpg`。
- */
-export function hashInName(name) {
-  const base = path.basename(String(name ?? ''))
-  const match = OUR_NAME_RE.exec(base) ?? LEGACY_NAME_RE.exec(base)
-  return match?.[1]?.toLowerCase() ?? ''
-}
-
 /** 是不是我们命名的图片文件（清理孤儿时用；用户自己丢进来的文件不碰）。 */
 export function isOurFileName(name) {
-  return OUR_NAME_RE.test(String(name ?? '')) || LEGACY_NAME_RE.test(String(name ?? ''))
+  const base = path.basename(String(name ?? ''))
+  if (tokensOfName(base).some((token) => HASH_TOKEN_RE.test(token))) return true
+  return /^[0-9a-f]{4,40}(?:-\d+)?\.[a-z0-9]+$/i.test(base)
 }
 
-/** 建好四个基础目录（幂等）。 */
+/** 建好基础目录（幂等）：四个顶层 + 待确认分类 + 无意义真/假。 */
 export async function ensureTreeDirs(imagesDir) {
   for (const name of TREE_ROOT_NAMES) {
     await mkdir(path.join(imagesDir, name), { recursive: true })
   }
+  await mkdir(path.join(imagesDir, TREE_DIRS.identified, TREE_DIRS.pending), { recursive: true })
+  await mkdir(path.join(imagesDir, TREE_DIRS.meaningless, TREE_DIRS.reviewTrue), { recursive: true })
+  await mkdir(path.join(imagesDir, TREE_DIRS.meaningless, TREE_DIRS.reviewFalse), { recursive: true })
 }
 
 /**
@@ -158,7 +218,7 @@ export async function ensureTreeDirs(imagesDir) {
  *   includeImageDirs=true 时，名字像图片的**目录**也会返回（备份要把它当读取失败记一条）
  * @returns {Promise<Array<{rel:string, abs:string, name:string, dirRel:string, bytes:number, isDir?:boolean}>>}
  */
-export async function walkImageFiles(imagesDir, { maxDepth = 4, includeImageDirs = false } = {}) {
+export async function walkImageFiles(imagesDir, { maxDepth = 5, includeImageDirs = false } = {}) {
   const out = []
   const walk = async (dir, dirRel, depth) => {
     let entries
@@ -188,25 +248,63 @@ export async function walkImageFiles(imagesDir, { maxDepth = 4, includeImageDirs
   return out
 }
 
-/** 把相对路径归到某一类（同步时判断用户把图挪到了哪）。 */
+/**
+ * 把相对路径归到某一类（同步时判断用户把图挪到了哪）。
+ *
+ * 注意 `已识别/待确认分类/<标签>/file` 与 `已识别/<标签>/file` 的区别：
+ * 前者是用户手工声明的标签，后者是自动整理结果。
+ */
 export function categoryOfRel(rel) {
   const parts = toPosix(rel).split('/').filter(Boolean)
   if (parts.length <= 1) return { kind: 'legacy' }
   const top = parts[0]
+
   if (top === TREE_DIRS.pendingDelete) return { kind: 'pending-delete' }
-  if (top === TREE_DIRS.meaningless) return { kind: 'meaningless' }
-  if (top === TREE_DIRS.untagged) return { kind: 'untagged' }
-  if (top === TREE_DIRS.identified) {
-    const tag = parts.length >= 3 ? parts[1] : ''
-    return tag ? { kind: 'identified', tag } : { kind: 'unknown', reason: '文件要放在 已识别/<标签名>/ 下面' }
+
+  if (top === TREE_DIRS.meaningless) {
+    if (parts.length === 2) return { kind: 'meaningless', review: '' }
+    const review = parts[1]
+    if (review === TREE_DIRS.reviewTrue) return { kind: 'meaningless', review: 'true' }
+    if (review === TREE_DIRS.reviewFalse) return { kind: 'meaningless', review: 'false' }
+    return { kind: 'unknown', reason: `无意义/ 下只认 ${TREE_DIRS.reviewTrue}/ 和 ${TREE_DIRS.reviewFalse}/` }
   }
+
+  if (top === TREE_DIRS.untagged) return { kind: 'untagged' }
+
+  if (top === TREE_DIRS.identified) {
+    if (parts.length === 2) return { kind: 'identified-root' }
+    const second = parts[1]
+    if (second === TREE_DIRS.pending) {
+      // 直接放在 待确认分类/ 下 → 从文件名解析；放在子目录里 → 目录名就是标签
+      if (parts.length === 3) return { kind: 'pending', tag: '' }
+      return { kind: 'pending', tag: parts[2] }
+    }
+    return { kind: 'identified', tag: second }
+  }
+
   return { kind: 'unknown', reason: `不认识的目录：${top}` }
 }
 
-/** 列出 已识别/ 下的标签目录（用户新建的空目录也算）。 */
+/** 列出 已识别/ 下的标签目录（排除 待确认分类；用户新建的空目录也算）。 */
 export async function listTagDirs(imagesDir) {
   try {
     const entries = await readdir(path.join(imagesDir, TREE_DIRS.identified), { withFileTypes: true })
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== TREE_DIRS.pending)
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b))
+  } catch {
+    return []
+  }
+}
+
+/** 列出 已识别/待确认分类/ 下用户新建的标签目录。 */
+export async function listPendingTagDirs(imagesDir) {
+  try {
+    const entries = await readdir(
+      path.join(imagesDir, TREE_DIRS.identified, TREE_DIRS.pending),
+      { withFileTypes: true },
+    )
     return entries
       .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
       .map((entry) => entry.name)
@@ -276,6 +374,7 @@ export async function relocateItemFile(imagesDir, item) {
  * 索引里记的路径不在时，按内容哈希在目录树里把文件找回来（只改路径，不改标签）。
  *
  * 这一步专门防「用户手动挪了图 → 重启 DSH → 启动自愈把条目当成文件丢失删掉」。
+ * 文件名里的哈希 token 可以出现在中间（`沙雕_1d5f_生气.jpg`），hashInName 会认。
  *
  * @returns {Promise<number>} 找回来的条数
  */
@@ -319,14 +418,33 @@ export async function reconcilePaths(imagesDir, items) {
   return adopted
 }
 
+/** 改一条目标的文件名去重（同目录重名时加 -2、-3）。 */
+async function uniqueAbs(imagesDir, targetRel) {
+  let rel = targetRel
+  let abs = path.join(imagesDir, rel)
+  let index = 1
+  while ((await fileInfo(abs)).exists) {
+    index++
+    rel = targetRel.replace(/(\.[a-z0-9]+)$/i, `-${index}$1`)
+    abs = path.join(imagesDir, rel)
+    if (index > 99) throw new Error('同名文件太多，排不下新文件名')
+  }
+  return { rel, abs }
+}
+
 /**
  * 分析目录树 → 生成一份「同步计划」（只读，不改任何东西）。
  *
- * 对每个图片文件：
- *   · 先按文件名里的哈希前缀找库条目；前缀唯一且大小一致就认了，否则算 sha1 精确匹配；
- *   · 按所在目录推出目标标签（无意义 / 未识别 / 已识别/<标签>）；
- *   · 待删除 下的进 delete 列表；标签/路径有变化的进 changes；
- *   · 认不出对应条目的文件进 unknown（只报告，不碰）。
+ * 规则（最终版）：
+ *   · `待确认分类/新标签_哈希.ext` → 取文件名里的**最后一个非哈希词**当新标签；
+ *   · `待确认分类/<新标签>/file`   → 目录名当新标签；
+ *   · `待确认分类/` 下解析不出标签 → 留在待确认分类，清空标签；
+ *   · `已识别/` 根目录散图          → 搬进待确认分类，清空标签；
+ *   · `无意义/真/`                 → 搬进待确认分类，清空标签；
+ *   · `无意义/假/`                 → 物理删除；
+ *   · `已识别/<标签>/`             → 只有和自动位置不一致才算人工改标签；
+ *   · `待删除/`                    → 物理删除；
+ *   · 认不出的文件                  → 只报告，不删不改（假/待删除 例外：用户明确要删）。
  *
  * @param {object} opts
  * @param {string} opts.imagesDir
@@ -346,9 +464,12 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
   const duplicates = []
   const changes = []
   const deletes = []
+  /** 认不出库条目、但用户明确要求挪/删的文件（按物理路径处理）。 */
+  const moves = []
   let unchanged = 0
 
   for (const file of files) {
+    const category = categoryOfRel(file.rel)
     let item = null
     const prefix = hashInName(file.name)
     if (prefix) {
@@ -365,21 +486,44 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
         item = null
       }
     }
+
+    // 用户明确丢进「删除区」的，不管库里有不有都要删
+    if (category.kind === 'pending-delete'
+      || (category.kind === 'meaningless' && category.review === 'false')) {
+      let owner = item
+      if (owner && usedKeys.has(owner.key)) owner = null
+      if (owner) usedKeys.add(owner.key)
+      deletes.push({ rel: file.rel, abs: file.abs, item: owner })
+      continue
+    }
+
     if (!item) {
+      // 认不出库条目：散图 / 无意义/真 仍按用户意图搬进待确认分类
+      if (category.kind === 'identified-root'
+        || (category.kind === 'meaningless' && category.review === 'true')) {
+        let hash = hashInName(file.name)
+        if (!hash) {
+          try { hash = sha1(await readFile(file.abs)).slice(0, 4) } catch { hash = '' }
+        }
+        if (hash) {
+          moves.push({
+            from: file.rel,
+            fromAbs: file.abs,
+            to: placementRel('pending', '', hash.slice(0, 4), extOf({ file: file.name })),
+          })
+          continue
+        }
+      }
       unknown.push({ rel: file.rel, name: file.name, reason: '库里没有这张图（插件不自动导入陌生文件）' })
       continue
     }
+
     if (usedKeys.has(item.key)) {
       duplicates.push({ rel: file.rel, id: item.src?.slice(0, 10) ?? '', reason: '同一张图在目录里出现了多份' })
       continue
     }
     usedKeys.add(item.key)
 
-    const category = categoryOfRel(file.rel)
-    if (category.kind === 'pending-delete') {
-      deletes.push({ rel: file.rel, abs: file.abs, item })
-      continue
-    }
     if (category.kind === 'unknown') {
       unknown.push({ rel: file.rel, name: file.name, reason: category.reason })
       continue
@@ -391,26 +535,54 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
     const auto = placementFor(item)
     const autoTag = auto.category === 'identified' ? sanitizeTagName(auto.tag) : ''
     let desiredTags = [...(item.tags ?? [])]
-    let tagChanged = false
+    let desiredPending = item.pending === true
+    let manual = false
+
     if (category.kind === 'identified') {
-      if (sanitizeTagName(category.tag) !== autoTag) {
-        desiredTags = [category.tag]
-        tagChanged = true
+      const folderTag = sanitizeTagName(category.tag)
+      if (folderTag !== autoTag) {
+        desiredTags = [folderTag]
+        desiredPending = false
+        manual = true
       }
+    } else if (category.kind === 'pending') {
+      const tag = category.tag ? sanitizeTagName(category.tag) : pendingTagFromName(file.name)
+      if (tag) {
+        desiredTags = [tag]
+        desiredPending = false
+      } else {
+        desiredTags = []
+        desiredPending = true
+      }
+      manual = true
+    } else if (category.kind === 'identified-root') {
+      // 已识别 根目录不再接受散图：统一进待确认分类，清空标签
+      desiredTags = []
+      desiredPending = true
+      manual = true
     } else if (category.kind === 'meaningless') {
-      if (!(item.tags ?? []).includes('无意义')) {
-        desiredTags = ['无意义']
-        tagChanged = true
+      if (category.review === 'true') {
+        desiredTags = []
+        desiredPending = true
+        manual = true
+      } else {
+        // 直接放在 无意义/ 下的图：保持「无意义」
+        if (!(item.tags ?? []).includes('无意义')) desiredTags = ['无意义']
+        desiredPending = false
       }
     } else if (category.kind === 'untagged') {
-      if ((item.tags ?? []).length > 0) {
+      if ((item.tags ?? []).length > 0 || item.pending === true) {
         desiredTags = []
-        tagChanged = true
+        desiredPending = false
+        manual = true
       }
     }
-    const desired = placementFor({ ...item, tags: desiredTags })
+
+    const tagChanged = JSON.stringify(item.tags ?? []) !== JSON.stringify(desiredTags)
+    const pendingChanged = (item.pending === true) !== desiredPending
+    const desired = placementFor({ ...item, tags: desiredTags, pending: desiredPending })
     const pathChanged = file.rel !== desired.rel
-    if (!tagChanged && !pathChanged) {
+    if (!tagChanged && !pendingChanged && !pathChanged) {
       unchanged++
       continue
     }
@@ -420,16 +592,20 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
       fromAbs: file.abs,
       to: desired.rel,
       tags: desiredTags,
+      pending: desiredPending,
       tagChanged,
+      pendingChanged,
       pathChanged,
-      manual: category.kind === 'identified' || category.kind === 'meaningless' || category.kind === 'untagged',
+      manual,
     })
   }
 
-  // 用户新建的标签目录：即使里面还是空的，也算「库里有这个标签」
+  // 新标签目录：已识别/ 下的（排除待确认分类）+ 待确认分类/ 下的
   const known = knownTags ?? new Set()
   const tagFolders = await listTagDirs(imagesDir)
-  const newTags = tagFolders.filter((tag) => !known.has(tag))
+  const pendingTagFolders = await listPendingTagDirs(imagesDir)
+  const newTags = [...new Set([...tagFolders, ...pendingTagFolders])]
+    .filter((tag) => tag && tag !== TREE_DIRS.pending && !known.has(tag))
 
   const missing = (items ?? []).filter((item) => item?.key && !usedKeys.has(item.key)).length
 
@@ -441,8 +617,10 @@ export async function analyzeTree({ imagesDir, items, knownTags } = {}) {
     duplicates,
     changes,
     deletes,
+    moves,
     newTags,
     tagFolders,
+    pendingTagFolders,
     missing,
   }
 }
@@ -467,23 +645,29 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     retagged: 0,
     moved: 0,
     adopted: 0,
+    pending: 0,
     unknown: plan.unknown.length,
     duplicates: plan.duplicates.length,
     newTags: plan.newTags,
     corrections: [],
     errors: [],
   }
+  const tagChangedEntries = plan.changes.filter((entry) => entry.tagChanged)
+  const pendingEntries = plan.changes.filter((entry) => entry.pendingChanged)
   if (dryRun) {
     result.deleted = plan.deletes.length
-    result.retagged = plan.changes.filter((entry) => entry.tagChanged).length
-    result.moved = plan.changes.filter((entry) => entry.pathChanged).length
-    result.corrections = plan.changes
-      .filter((entry) => entry.tagChanged)
-      .map((entry) => ({ id: String(entry.item.src ?? '').slice(0, 10), from: [...(entry.item.tags ?? [])], to: entry.tags }))
+    result.retagged = tagChangedEntries.length
+    result.moved = plan.changes.filter((entry) => entry.pathChanged).length + plan.moves.length
+    result.pending = pendingEntries.length + plan.moves.length
+    result.corrections = tagChangedEntries.map((entry) => ({
+      id: String(entry.item.src ?? '').slice(0, 10),
+      from: [...(entry.item.tags ?? [])],
+      to: entry.tags,
+    }))
     return result
   }
 
-  // ① 待删除：物理删文件 + 删索引条目
+  // ① 删除区：物理删文件 + 删索引条目（认不出的文件也删）
   for (const entry of plan.deletes) {
     try {
       if (entry.item) {
@@ -492,7 +676,6 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
         const removed = await library.removeItem(entry.item)
         if (removed) result.deleted++
       } else {
-        const { removeFile } = await import('./util.js')
         await removeFile(entry.abs)
         result.deleted++
       }
@@ -501,19 +684,39 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
     }
   }
 
-  // ② 改标签 / 换位置（人工修正要留痕，后续打标不能把它盖回去）
+  // ② 认不出条目、但用户要求搬进待确认分类的散图（只动文件）
+  for (const entry of plan.moves) {
+    try {
+      const target = await uniqueAbs(imagesDir, entry.to)
+      await mkdir(path.dirname(target.abs), { recursive: true })
+      await rename(entry.fromAbs, target.abs)
+      result.moved++
+      result.pending++
+    } catch (error) {
+      result.errors.push(`移动 ${entry.from} 失败：${error?.message ?? error}`)
+    }
+  }
+
+  // ③ 改标签 / 换位置（人工修正要留痕，后续打标不能把它盖回去）
   for (const entry of plan.changes) {
     try {
       const item = entry.item
       const before = [...(item.tags ?? [])]
       item.tags = [...new Set(entry.tags.map(String).map((tag) => tag.trim()).filter(Boolean))].slice(0, 6)
+      item.pending = entry.pending === true
       item.tagTriedAt = Date.now()
-      if (entry.tagChanged && entry.manual) {
+      if (entry.manual && (entry.tagChanged || entry.pendingChanged)) {
         item.manualTag = item.tags[0] ?? ''
         item.manualTagFrom = before
         item.manualTagAt = Date.now()
         item.manualEdits = Math.max(0, Number(item.manualEdits) || 0) + 1
-        result.corrections.push({ id: String(item.src ?? '').slice(0, 10), from: before, to: [...item.tags] })
+      }
+      if (entry.tagChanged) {
+        result.corrections.push({
+          id: String(item.src ?? '').slice(0, 10),
+          from: before,
+          to: [...item.tags],
+        })
       }
       // 先把路径对齐到用户实际放的位置，再交给 relocate 统一改名
       item.file = entry.from
@@ -522,13 +725,14 @@ export async function applyTreePlan(plan, { library, imagesDir, dryRun = false }
       if (placed.moved) result.moved++
       if (placed.adopted) result.adopted++
       if (entry.tagChanged) result.retagged++
+      if (entry.pendingChanged) result.pending++
       library.touch?.()
     } catch (error) {
       result.errors.push(`同步 ${entry.from} 失败：${error?.message ?? error}`)
     }
   }
 
-  // ③ 新标签目录：写进库的额外词表（即使 settings 不可用，也不会丢）
+  // ④ 新标签目录：写进库的额外词表（即使 settings 不可用，也不会丢）
   for (const tag of plan.newTags ?? []) {
     library.rememberTag?.(tag)
   }

@@ -19,8 +19,8 @@ import {
   sha1, sniffImage, todayKey, writeBytes, writeJsonAtomic,
 } from './util.js'
 import {
-  TREE_ROOT_NAMES, isOurFileName, placementRel, reconcilePaths,
-  relocateItemFile, toPosix, walkImageFiles,
+  TREE_DIRS, TREE_ROOT_NAMES, ensureTreeDirs, isOurFileName, placementRel,
+  reconcilePaths, relocateItemFile, toPosix, walkImageFiles,
 } from './tree.js'
 
 /** 索引结构版本。不兼容的旧结构直接重来（不猜着迁移）。 */
@@ -70,6 +70,8 @@ function emptyItem() {
     tagTriedAt: 0,
     viewedAt: 0,
     hidden: false,
+    /** 等着人工分类：待在 已识别/待确认分类/，不参与自动打标（标签为空）。 */
+    pending: false,
     // 人工修正留痕（「确认应用本地整理」按文件夹改的标签）：后续打标不能盖回去
     manualTag: '',
     manualTagFrom: [],
@@ -126,6 +128,7 @@ function normalizeItem(raw, imagesDir) {
   item.tagTriedAt = num(raw.tagTriedAt, 0)
   item.viewedAt = num(raw.viewedAt, 0)
   item.hidden = raw.hidden === true
+  item.pending = raw.pending === true
   item.manualTag = String(raw.manualTag ?? '').slice(0, 30)
   item.manualTagFrom = Array.isArray(raw.manualTagFrom) ? raw.manualTagFrom.map(String).filter(Boolean).slice(0, 6) : []
   item.manualTagAt = num(raw.manualTagAt, 0)
@@ -270,6 +273,8 @@ export class Library {
     const hiddenConfig = new Set(this.config.library.hiddenIds)
     return this.items.filter((item) => {
       if (item.hidden) return false
+      // 待确认分类：等人工分类，不参与打标/发送/删最早，避免自动流程把它抢走
+      if (item.pending === true) return false
       const sid = shortId(item)
       if (blocked.has(sid) || blocked.has(String(item.src))) return false
       if (hiddenConfig.has(sid)) return false
@@ -505,6 +510,8 @@ export class Library {
         ? tags.map((tag) => (tag.includes('无意义') ? '无意义' : tag.slice(0, 30)))
         : tags.map(normalizeTag).filter(Boolean)
       item.tags = [...new Set(normalized)].slice(0, 6)
+      // 打上标签就不再是「待确认」了；pending 优先级高于 tags，必须一起清
+      if (item.tags.length > 0) item.pending = false
     }
     if (patch.note !== undefined) item.note = String(patch.note ?? '').slice(0, 200)
     if (patch.text !== undefined) item.text = String(patch.text ?? '').slice(0, 80)
@@ -578,6 +585,9 @@ export class Library {
    */
   async migrateTree() {
     await this.load()
+    // 启动就把分类目录建好：用户重开 DSH 后能直接在资源管理器里看到
+    // 待确认分类/、无意义/真/、无意义/假/，不用自己猜路径
+    await ensureTreeDirs(this.imagesDir)
     const adopted = await reconcilePaths(this.imagesDir, this.items)
     let moved = 0
     for (const item of [...this.items]) {
@@ -606,6 +616,13 @@ export class Library {
     let removed = 0
     for (const file of files) {
       if (referenced.has(file.rel)) continue
+      // 人工暂存区不碰：用户可能刚挪过来还没点同步
+      const staging = [
+        `${TREE_DIRS.identified}/${TREE_DIRS.pending}/`,
+        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewTrue}/`,
+        `${TREE_DIRS.meaningless}/${TREE_DIRS.reviewFalse}/`,
+      ]
+      if (staging.some((prefix) => file.rel.startsWith(prefix))) continue
       // 用户自己丢进来的图片不碰（只清 `<标签>_<hash>.<ext>` / 旧版哈希名）
       if (!isOurFileName(file.name)) continue
       await removeFile(file.abs)
@@ -630,6 +647,7 @@ export class Library {
       untagged: this.items.length - tagged,
       animated,
       meaningless: this.items.filter((item) => item.tags.includes('无意义')).length,
+      pending: this.items.filter((item) => item.pending === true).length,
       sentItems: sentItems.length,
       sentTotal: this.items.reduce((sum, item) => sum + item.sentCount, 0),
       shownItems: shown.length,
@@ -644,7 +662,7 @@ export class Library {
     const lines = []
     const push = (text) => lines.push(text)
     push(`表情库：${s.total} 张（可见 ${s.visible}｜隐藏 ${s.hidden}｜动图 ${s.animated}）`)
-    push(`已认识 ${s.tagged} 张｜没认识 ${s.untagged} 张｜标「无意义」${s.meaningless} 张`)
+    push(`已认识 ${s.tagged} 张｜没认识 ${s.untagged} 张｜标「无意义」${s.meaningless} 张｜待确认 ${s.pending} 张`)
     push(`被发过 ${s.sentItems} 张，累计 ${s.sentTotal} 次｜有互动统计 ${s.shownItems} 张`)
     push(`占用 ${(s.bytes / 1048576).toFixed(1)} MB`)
 

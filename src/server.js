@@ -81,6 +81,7 @@ export function registerRoutes(ctx, runtime) {
         untagged: stats.untagged,
         animated: stats.animated,
         meaningless: stats.meaningless,
+        pending: stats.pending,
         bytes: stats.bytes,
         freedMB: Number((stats.bytes / 1048576).toFixed(1)),
       },

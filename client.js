@@ -2365,6 +2365,7 @@ window.__ModuleLoader__.load({
       const tagged = Number(library.tagged) || 0
       const untagged = Number(library.untagged) || 0
       const meaningless = Number(library.meaningless) || 0
+      const pending = Number(library.pending) || 0
       const animated = Number(library.animated) || 0
       const hidden = Number(library.hidden) || 0
       const usedToday = Number(send.usedToday) || 0
@@ -2426,6 +2427,7 @@ window.__ModuleLoader__.load({
             h(Chip, { label: '已打标', value: fmtNum(tagged), tone: tagged > 0 ? 'ok' : undefined }),
             h(Chip, { label: '待打标', value: fmtNum(untagged), tone: untagged > 0 ? 'warn' : undefined }),
             h(Chip, { label: '判无意义', value: fmtNum(meaningless), tone: meaningless > 0 ? 'warn' : undefined }),
+            h(Chip, { label: '待确认', value: fmtNum(pending), tone: pending > 0 ? 'warn' : undefined }),
             h(Chip, { label: '动图', value: fmtNum(animated) }),
             h(Chip, { label: '已隐藏', value: fmtNum(hidden) }))),
 
@@ -2616,14 +2618,15 @@ window.__ModuleLoader__.load({
       }
       if (kind === 'sync_tree') {
         const lines = [
-          `扫描 ${result.scanned ?? 0} 个文件：改标签 ${result.retagged ?? 0} 张、换位置 ${result.moved ?? 0} 张、物理删除 ${result.deleted ?? 0} 张`,
+          `扫描 ${result.scanned ?? 0} 个文件：改标签 ${result.retagged ?? 0} 张、换位置 ${result.moved ?? 0} 张、物理删除 ${result.deleted ?? 0} 张`
+            + `${result.pending ? `、转入待确认 ${result.pending} 张` : ''}`,
         ]
         if (Array.isArray(result.newTags) && result.newTags.length > 0) {
           lines.push(`新标签目录：${result.newTags.join('、')}${result.tagsSaved === false ? '（已记进库；写配置词表失败，重启后可再同步一次）' : ''}`)
         }
         if (Array.isArray(result.corrections) && result.corrections.length > 0) {
           for (const row of result.corrections.slice(0, 3)) {
-            lines.push(`· #${row.id}：${(row.from ?? []).join('/') || '未分类'} → ${(row.to ?? []).join('/')}`)
+            lines.push(`· #${row.id}：${(row.from ?? []).join('/') || '未分类'} → ${(row.to ?? []).join('/') || '待确认分类'}`)
           }
           if (result.corrections.length > 3) lines.push(`（还有 ${result.corrections.length - 3} 条人工修正）`)
         }
@@ -2783,10 +2786,11 @@ window.__ModuleLoader__.load({
               h('span', { className: 'qqs-card-title-icon' }, h(Glyph, { name: 'folder', size: 14 })),
               '确认应用本地整理')),
           h('div', { className: 'qqs-card-desc' },
-            '图片已经按标签分好目录：已识别/<标签名>/、无意义/、待删除/、未识别/。',
-            '你可以直接在「打开本地文件夹」里手动挪图 —— 从 无意义/ 挪到 已识别/哈基米/，或者丢进 待删除/，',
-            '再点下面的按钮。插件会扫描目录：按文件夹改标签、记住这次人工修正、把 待删除/ 里的图彻底删掉；',
-            '新建的标签文件夹也会登记进标签词表。'),
+            '图片已经按标签分好目录：已识别/<标签名>/、已识别/待确认分类/、无意义/（真/、假/）、待删除/、未识别/。',
+            '改错标签就把图剪切到 已识别/待确认分类/，重命名为 新标签_原哈希.jpg（如 生气_1d5f.jpg；',
+            '也可以在原名后追加，如 沙雕_1d5f_生气.jpg），再点这个按钮。',
+            '无意义/真/ 里的图会转进待确认分类并清空标签；无意义/假/ 里的图直接物理删除；',
+            '待确认分类 里新建的 开心/ 这种文件夹，目录名就是新标签。'),
           h('div', { className: 'qqs-action-ctl' },
             h(Button, {
               variant: 'primary',
