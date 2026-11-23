@@ -173,7 +173,11 @@ export async function buildTools(runtime) {
       activity: limits.activityLabel,
       perSessionDaily: limits.perSessionDaily,
       usedToday,
-      remaining: limits.perSessionDaily > 0 ? Math.max(0, limits.perSessionDaily - usedToday) : null,
+      // 注意：output schema 里 remaining 是 number，不能返回 null
+      //（官方工具输出校验 additionalProperties:false + 类型严格，null 会整条工具调用失败）。
+      // 0 = 不限；真要区分"不限"和"用完"看 perSessionDaily。
+      remaining: limits.perSessionDaily > 0 ? Math.max(0, limits.perSessionDaily - usedToday) : 0,
+      unlimited: limits.perSessionDaily <= 0,
     }
   }
 
@@ -227,9 +231,12 @@ export async function buildTools(runtime) {
             type: 'object',
             additionalProperties: false,
             properties: {
-              level: { type: 'string' },
-              activity: { type: 'string' },
-              remaining: { type: 'number' },
+              level: { type: 'string', description: '当前配图档位。' },
+              activity: { type: 'string', description: '当前活跃度。' },
+              perSessionDaily: { type: 'number', description: '本会话每日额度；0 = 不限。' },
+              usedToday: { type: 'number', description: '本会话今天已发张数。' },
+              remaining: { type: 'number', description: '今天还能发几张（unlimited=true 时无意义）。' },
+              unlimited: { type: 'boolean', description: 'true = 当前档位不限额度。' },
             },
           },
         },
